@@ -1,0 +1,337 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: CI run ID to promote into this tagged release.
+        required: true
+        type: string
+      default_post_release_phase:
+        description: Phase for the next version after a successful release (pre, rc, rtm).
+        required: false
+        default: pre
+        type: choice
+        options:
+          - pre
+          - rc
+          - rtm
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: read
+
+    outputs:
+      version: ${{ steps.context.outputs.version }}
+      ci_run_id: ${{ steps.context.outputs.ci_run_id }}
+      is_prerelease: ${{ steps.context.outputs.is_prerelease }}
+      default_post_release_phase: ${{ steps.context.outputs.default_post_release_phase }}
+      state_json: ${{ steps.context.outputs.state_json }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3ced7
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve tag context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG='${{ github.ref_name }}'
+          VERSION="${TAG#v}"
+          CI_RUN_ID='${{ github.event.inputs.ci_run_id }}'
+          DEFAULT_PHASE='${{ github.event.inputs.default_post_release_phase }}'
+
+          if [[ "$VERSION" == *-* ]]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
+          git fetch origin release-state >/dev/null 2>&1 || true
+          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
+            STATE_JSON=$(git show origin/release-state:version-state.json)
+          else
+            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=${CI_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "default_post_release_phase=${DEFAULT_PHASE}" >> "$GITHUB_OUTPUT"
+          echo "state_json=$(echo "$STATE_JSON" | jq -c '.')" >> "$GITHUB_OUTPUT"
+
+          echo "## Release Context" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **CI Run:** \`${CI_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Prerelease:** \`${IS_PRERELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download promotable bundle from CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ./artifacts
+          gh run download "${{ steps.context.outputs.ci_run_id }}" --repo "${{ github.repository }}" --name native-promotable-bundle --dir ./artifacts
+
+      - name: Verify release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_VERSION='${{ steps.context.outputs.version }}'
+          METADATA_FILE='./artifacts/release-metadata.json'
+
+          if [ ! -f "$METADATA_FILE" ]; then
+            echo "::error::Missing release metadata file."
+            exit 1
+          fi
+
+          ACTUAL_VERSION=$(jq -r '.version' "$METADATA_FILE")
+          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Release metadata version mismatch. Expected '$EXPECTED_VERSION' but found '$ACTUAL_VERSION'."
+            exit 1
+          fi
+
+      - name: Upload unsigned release bundle
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: release-unsigned-bundle
+          path: ./artifacts/*
+          retention-days: 7
+
+  sign-windows:
+    runs-on: windows-2022
+    needs: prepare-release
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download unsigned release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-unsigned-bundle
+          path: ./artifacts/bundle
+
+      - name: Expand Windows release assets
+        shell: pwsh
+        run: ./scripts/Expand-WindowsReleaseAssets.ps1 -BundleDirectory './artifacts/bundle' -WorkingDirectory './artifacts/windows-assets'
+
+      - name: Determine signing availability
+        id: signing
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+        run: |
+          $required = @(
+            'AZURE_CLIENT_ID',
+            'AZURE_TENANT_ID',
+            'AZURE_SUBSCRIPTION_ID',
+            'AZURE_SIGNING_ENDPOINT',
+            'AZURE_SIGNING_ACCOUNT',
+            'AZURE_CERT_PROFILE'
+          )
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            Write-Host "::warning::Skipping Windows signing because Azure signing secrets are not fully configured. Missing: $($missing -join ', ')"
+          } else {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Azure login
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows executables
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\artifacts\windows-assets
+          files-folder-filter: templatecli.exe
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Verify signed Windows issuer
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $binaryPaths = @(Get-ChildItem -Path './artifacts/windows-assets' -Recurse -Filter 'templatecli.exe' -File)
+          if ($binaryPaths.Count -eq 0) {
+            throw "No signed templatecli.exe files were found under './artifacts/windows-assets'."
+          }
+
+          foreach ($binaryPath in $binaryPaths) {
+            ./scripts/Verify-WindowsBinaryIssuer.ps1 -BinaryPath $binaryPath.FullName -InstallerScriptPath './scripts/install/install-templatecli.ps1'
+          }
+
+      - name: Repack signed Windows assets
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: ./scripts/Compress-WindowsReleaseAssets.ps1 -WorkingDirectory './artifacts/windows-assets' -OutputDirectory './artifacts/signed-windows-assets'
+
+      - name: Reuse unsigned Windows assets
+        if: steps.signing.outputs.enabled != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path './artifacts/signed-windows-assets' -Force | Out-Null
+          Get-ChildItem -Path './artifacts/bundle' -Filter 'templatecli-win-*.zip' -File | Copy-Item -Destination './artifacts/signed-windows-assets' -Force
+          Write-Host "Continuing with unsigned Windows archives because Azure signing configuration is not present yet."
+
+      - name: Upload signed Windows assets
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: release-signed-windows-assets
+          path: ./artifacts/signed-windows-assets/*
+          retention-days: 7
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [prepare-release, sign-windows]
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Download unsigned release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-unsigned-bundle
+          path: ./artifacts/release
+
+      - name: Download signed Windows assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-signed-windows-assets
+          path: ./artifacts/signed-windows-assets
+
+      - name: Overlay signed Windows assets
+        shell: pwsh
+        run: Copy-Item './artifacts/signed-windows-assets/*' './artifacts/release' -Force
+
+      - name: Regenerate release metadata
+        shell: pwsh
+        run: ./scripts/Update-ReleaseBundleMetadata.ps1 -BundleDirectory './artifacts/release'
+
+      - name: Verify updated release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION='${{ needs.prepare-release.outputs.version }}'
+          ACTUAL_VERSION=$(jq -r '.version' './artifacts/release/release-metadata.json')
+          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Release metadata version mismatch after signing. Expected '$EXPECTED_VERSION' but found '$ACTUAL_VERSION'."
+            exit 1
+          fi
+
+      - name: Attest final release archives
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: ./artifacts/release/templatecli-*.zip,./artifacts/release/templatecli-*.tar.gz
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG='${{ github.ref_name }}'
+          VERSION='${{ needs.prepare-release.outputs.version }}'
+          IS_PRERELEASE='${{ needs.prepare-release.outputs.is_prerelease }}'
+
+          EXTRA_ARGS=()
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            EXTRA_ARGS+=(--prerelease --latest=false)
+          fi
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes
+          fi
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            "${EXTRA_ARGS[@]}" \
+            --title "$TAG" \
+            --generate-notes \
+            ./artifacts/release/*
+
+      - name: Advance release state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          STATE_JSON='${{ needs.prepare-release.outputs.state_json }}'
+          VERSION='${{ needs.prepare-release.outputs.version }}'
+          DEFAULT_PHASE='${{ needs.prepare-release.outputs.default_post_release_phase }}'
+
+          NEW_STATE_JSON=$(dotnet scripts/version.cs advance --state "$STATE_JSON" --shipped-version "$VERSION" --default-phase "$DEFAULT_PHASE")
+
+          mkdir -p ./artifacts/release-state
+          printf '%s\n' "$NEW_STATE_JSON" > ./artifacts/release-state/version-state.json
+          ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Advance release state after ${VERSION}"

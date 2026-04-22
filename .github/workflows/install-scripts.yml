@@ -1,0 +1,157 @@
+name: Publish Install Scripts
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: install-scripts
+  cancel-in-progress: false
+
+jobs:
+  sign-install-script:
+    runs-on: windows-2022
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      signing_enabled: ${{ steps.signing.outputs.enabled }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Stage install scripts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path ./artifacts/install-script -Force | Out-Null
+          Copy-Item ./scripts/install/install-templatecli.ps1 ./artifacts/install-script/install.ps1 -Force
+          Copy-Item ./scripts/install/install-templatecli.sh ./artifacts/install-script/install.sh -Force
+
+      - name: Determine signing availability
+        id: signing
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+        run: |
+          $required = @(
+            'AZURE_CLIENT_ID',
+            'AZURE_TENANT_ID',
+            'AZURE_SUBSCRIPTION_ID',
+            'AZURE_SIGNING_ENDPOINT',
+            'AZURE_SIGNING_ACCOUNT',
+            'AZURE_CERT_PROFILE'
+          )
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            Write-Host "::warning::Skipping install-script signing because Azure signing secrets are not fully configured. Missing: $($missing -join ', ')"
+          } else {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Azure login
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign install.ps1
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\artifacts\install-script
+          files-folder-filter: install.ps1
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Upload staged install scripts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: staged-install-scripts
+          path: ./artifacts/install-script/*
+          retention-days: 7
+
+  publish-install-scripts:
+    runs-on: ubuntu-latest
+    needs: sign-install-script
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Download staged install scripts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: staged-install-scripts
+          path: ./artifacts/install-script
+
+      - name: Generate install script manifest
+        id: manifest
+        shell: pwsh
+        run: |
+          $version = "install-scripts-v$(Get-Date -Format 'yyyy.MM.dd').${{ github.run_number }}"
+          ./scripts/Write-InstallScriptsManifest.ps1 -Directory './artifacts/install-script' -Version $version -SourceCommit '${{ github.sha }}' -SourceRef 'refs/heads/main'
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Publish install-scripts branch and tag snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION='${{ steps.manifest.outputs.version }}'
+          BRANCH_COMMIT=$(./scripts/publish-branch-content.sh install-scripts ./artifacts/install-script "Publish ${VERSION}")
+
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag ${VERSION} already exists."
+            exit 1
+          fi
+
+          git tag -a "$VERSION" "$BRANCH_COMMIT" -m "Published install scripts snapshot ${VERSION}"
+          git push origin "$VERSION"
+
+          gh workflow run attest-install-scripts.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$VERSION"
+
+          echo "## Install Scripts Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Branch:** \`install-scripts\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Source commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Signing enabled:** \`${{ needs.sign-install-script.outputs.signing_enabled }}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,268 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      dev_version: ${{ steps.version.outputs.dev_version }}
+      release_version: ${{ steps.version.outputs.release_version }}
+      next_state: ${{ steps.version.outputs.next_state }}
+      state_json: ${{ steps.version.outputs.state_json }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Calculate versions from release state
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin release-state >/dev/null 2>&1 || true
+
+          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
+            STATE_JSON=$(git show origin/release-state:version-state.json)
+          else
+            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
+          fi
+
+          VERSIONS_JSON=$(dotnet scripts/version.cs calculate --state "$STATE_JSON")
+          DEV_VERSION=$(echo "$VERSIONS_JSON" | jq -r '.devVersion')
+          RELEASE_VERSION=$(echo "$VERSIONS_JSON" | jq -r '.rcVersion')
+          NEXT_STATE=$(echo "$VERSIONS_JSON" | jq -r '.nextState')
+          STATE_JSON_COMPACT=$(echo "$STATE_JSON" | jq -c '.')
+
+          echo "dev_version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_version=${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "next_state=${NEXT_STATE}" >> "$GITHUB_OUTPUT"
+          echo "state_json=${STATE_JSON_COMPACT}" >> "$GITHUB_OUTPUT"
+
+          echo "## Version Information" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Current state:** \`${STATE_JSON_COMPACT}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Dev version:** \`${DEV_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Promotable release version:** \`${RELEASE_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  validate-powershell-scripts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Validate PowerShell script syntax
+        shell: pwsh
+        run: ./scripts/Verify-PowerShellSyntax.ps1
+
+  validate-shell-scripts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Validate shell script syntax
+        shell: bash
+        run: ./scripts/verify-shell-syntax.sh
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [version, validate-powershell-scripts, validate-shell-scripts]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Build
+        uses: ./.github/actions/build
+        with:
+          version: ${{ needs.version.outputs.dev_version }}
+          validate-native-aot: 'true'
+          aot-runtime-identifier: linux-x64
+
+  publish-dev:
+    needs: [version, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            rid: win-x64
+          - runner: windows-latest
+            rid: win-arm64
+          - runner: ubuntu-22.04
+            rid: linux-x64
+          - runner: ubuntu-22.04-arm
+            rid: linux-arm64
+          - runner: macos-latest
+            rid: osx-x64
+          - runner: macos-latest
+            rid: osx-arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Publish dev asset
+        uses: ./.github/actions/publish-native
+        with:
+          runtime-identifier: ${{ matrix.rid }}
+          version: ${{ needs.version.outputs.dev_version }}
+          artifacts-directory: './artifacts/dev'
+          artifact-name: native-dev-${{ matrix.rid }}
+
+  publish-promotable:
+    needs: [version, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            rid: win-x64
+          - runner: windows-latest
+            rid: win-arm64
+          - runner: ubuntu-22.04
+            rid: linux-x64
+          - runner: ubuntu-22.04-arm
+            rid: linux-arm64
+          - runner: macos-latest
+            rid: osx-x64
+          - runner: macos-latest
+            rid: osx-arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Publish promotable asset
+        uses: ./.github/actions/publish-native
+        with:
+          runtime-identifier: ${{ matrix.rid }}
+          version: ${{ needs.version.outputs.release_version }}
+          artifacts-directory: './artifacts/promotable'
+          artifact-name: native-promotable-${{ matrix.rid }}
+
+  bundle-dev:
+    runs-on: ubuntu-latest
+    needs: [version, publish-dev]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download dev artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: native-dev-*
+          path: ./artifacts/dev
+          merge-multiple: true
+
+      - name: Create dev bundle
+        shell: pwsh
+        run: ./scripts/Merge-ReleaseBundle.ps1 -InputDirectory './artifacts/dev' -OutputDirectory './bundle/dev' -Version '${{ needs.version.outputs.dev_version }}'
+
+      - name: Upload dev bundle artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-dev-bundle
+          path: ./bundle/dev/*
+          retention-days: 90
+
+      - name: Publish public dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          ./scripts/update-dev-release.sh \
+            '${{ needs.version.outputs.dev_version }}' \
+            './bundle/dev' \
+            'Development channel build published from CI.'
+
+  bundle-promotable:
+    runs-on: ubuntu-latest
+    needs: [version, publish-promotable]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Download promotable artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: native-promotable-*
+          path: ./artifacts/promotable
+          merge-multiple: true
+
+      - name: Create promotable bundle
+        shell: pwsh
+        run: ./scripts/Merge-ReleaseBundle.ps1 -InputDirectory './artifacts/promotable' -OutputDirectory './bundle/promotable' -Version '${{ needs.version.outputs.release_version }}'
+
+      - name: Upload promotable bundle artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-promotable-bundle
+          path: ./bundle/promotable/*
+          retention-days: 90
+
+  update-release-state:
+    runs-on: ubuntu-latest
+    needs: [version, bundle-dev, bundle-promotable]
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Publish next release state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ./artifacts/release-state
+          printf '%s\n' '${{ needs.version.outputs.next_state }}' | jq -R 'split("|") | {base: .[0], phase: .[1], phaseNumber: (.[2] | tonumber), devNumber: (.[3] | tonumber), pending: .[4]}' > ./artifacts/release-state/version-state.json
+          ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Update release state after CI for ${{ needs.version.outputs.dev_version }}"

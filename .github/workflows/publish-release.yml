@@ -1,0 +1,117 @@
+name: Publish Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: "Optional CI run ID to promote. Defaults to the latest successful CI run on main."
+        required: false
+        default: ''
+      default_post_release_phase:
+        description: "Phase for the next version after a successful release (pre, rc, rtm). Defaults to repo variable DEFAULT_POST_RELEASE_PHASE or 'pre'."
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - pre
+          - rc
+          - rtm
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  publish-tag:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve release version and CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin release-state >/dev/null 2>&1 || true
+
+          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
+            STATE_JSON=$(git show origin/release-state:version-state.json)
+          else
+            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
+          fi
+
+          VERSIONS_JSON=$(dotnet scripts/version.cs calculate --state "$STATE_JSON")
+          VERSION=$(echo "$VERSIONS_JSON" | jq -r '.rcVersion')
+
+          CI_RUN_ID='${{ github.event.inputs.ci_run_id }}'
+          if [ -z "$CI_RUN_ID" ]; then
+            CI_RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow=ci.yml --branch=main --status=success --limit=1 --json databaseId --jq '.[0].databaseId // empty')
+          fi
+
+          if [ -z "$CI_RUN_ID" ]; then
+            echo "::error::No successful CI run found to promote."
+            exit 1
+          fi
+
+          CI_HEAD_SHA=$(gh run view "$CI_RUN_ID" --repo "${{ github.repository }}" --json headSha --jq '.headSha // empty')
+          if [ -z "$CI_HEAD_SHA" ]; then
+            echo "::error::Could not determine the commit SHA for CI run ${CI_RUN_ID}."
+            exit 1
+          fi
+
+          DEFAULT_PHASE='${{ github.event.inputs.default_post_release_phase }}'
+          if [ -z "$DEFAULT_PHASE" ]; then
+            DEFAULT_PHASE='${{ vars.DEFAULT_POST_RELEASE_PHASE }}'
+          fi
+          if [ -z "$DEFAULT_PHASE" ]; then
+            DEFAULT_PHASE='pre'
+          fi
+
+          if [[ ! "$DEFAULT_PHASE" =~ ^(pre|rc|rtm)$ ]]; then
+            echo "::error::Invalid post-release phase '${DEFAULT_PHASE}'. Must be pre, rc, or rtm."
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
+          if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists."
+            exit 1
+          fi
+
+          git tag -a "$TAG" "$CI_HEAD_SHA" -m "Promote CI run ${CI_RUN_ID} to ${TAG}"
+          git push origin "$TAG"
+
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$TAG" \
+            -f ci_run_id="${CI_RUN_ID}" \
+            -f default_post_release_phase="${DEFAULT_PHASE}"
+
+          echo "## Release Tag Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Version:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **CI Run:** \`${CI_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit:** \`${CI_HEAD_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Release workflow:** queued on ref \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"

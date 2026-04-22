@@ -1,0 +1,270 @@
+using System.CommandLine;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using TemplateCli.Infrastructure;
+using TemplateCli.Services;
+
+namespace TemplateCli.Commands;
+
+public static class UpdateCommand
+{
+    public const string UpdateSourceEnvVar = AppIdentity.UpdateSourceEnvVar;
+
+    public static Command Create(IServiceProvider services)
+    {
+        var command = new Command("update", "Check for and install updates");
+
+        var checkOption = new Option<bool>("--check")
+        {
+            Description = "Only check for updates without downloading or installing"
+        };
+        var preReleaseOption = new Option<bool>("--pre-release", "-p")
+        {
+            Description = "Include pre-release versions as update candidates"
+        };
+        var stableOnlyOption = new Option<bool>("--stable-only")
+        {
+            Description = "Only consider stable releases, ignoring any configured pre-release default"
+        };
+        var skipProvenanceOption = new Option<bool>("--skip-provenance-checks")
+        {
+            Description = "Disable provenance verification (Authenticode on Windows, attestation on Linux/macOS)"
+        };
+        var dryRunOption = new Option<bool>("--dry-run")
+        {
+            Description = "Show what would happen without making any changes"
+        };
+        var installStagedOption = new Option<bool>("--install-staged")
+        {
+            Description = "Install a previously staged update binary",
+            Hidden = true
+        };
+        var waitForPidOption = new Option<int?>("--wait-for-pid") { Hidden = true };
+        var waitForStartTimeOption = new Option<string?>("--wait-for-start-time") { Hidden = true };
+        var passiveWaitOption = new Option<bool>("--passive-wait") { Hidden = true };
+
+        command.Options.Add(checkOption);
+        command.Options.Add(preReleaseOption);
+        command.Options.Add(stableOnlyOption);
+        command.Options.Add(skipProvenanceOption);
+        command.Options.Add(dryRunOption);
+        command.Options.Add(installStagedOption);
+        command.Options.Add(waitForPidOption);
+        command.Options.Add(waitForStartTimeOption);
+        command.Options.Add(passiveWaitOption);
+
+        command.SetAction(async (parseResult, ct) =>
+        {
+            var logger = services.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(UpdateCommand));
+            return await ConsoleOutput.RunWithErrorHandling(async () =>
+            {
+                var updateService = services.GetRequiredService<UpdateService>();
+                var stateStore = services.GetRequiredService<StateStore>();
+                var runtimeContext = services.GetRequiredService<RuntimeContext>();
+                var config = stateStore.LoadConfig();
+
+                var check = parseResult.GetValue(checkOption);
+                var usePreRelease = parseResult.GetResult(preReleaseOption) is not null;
+                var useStableOnly = parseResult.GetResult(stableOnlyOption) is not null;
+                var skipProvenance = parseResult.GetValue(skipProvenanceOption);
+                var dryRun = parseResult.GetValue(dryRunOption);
+                var installStaged = parseResult.GetValue(installStagedOption);
+                var waitForPid = parseResult.GetValue(waitForPidOption);
+                var waitForStartTimeRaw = parseResult.GetValue(waitForStartTimeOption);
+                var passiveWait = parseResult.GetValue(passiveWaitOption);
+
+                if (usePreRelease && useStableOnly)
+                {
+                    ConsoleOutput.Error("--pre-release and --stable-only cannot be used together.");
+                    return 1;
+                }
+
+                var preRelease = useStableOnly
+                    ? false
+                    : usePreRelease
+                        ? parseResult.GetValue(preReleaseOption)
+                        : config.IncludePrereleaseUpdates;
+
+                DateTimeOffset? waitForStartTime = null;
+                if (!string.IsNullOrWhiteSpace(waitForStartTimeRaw))
+                {
+                    if (!DateTimeOffset.TryParse(waitForStartTimeRaw, out var parsedStartTime))
+                    {
+                        ConsoleOutput.Error($"Invalid --wait-for-start-time value: {waitForStartTimeRaw}");
+                        return 1;
+                    }
+
+                    waitForStartTime = parsedStartTime;
+                }
+
+                if ((waitForPid is null) != (waitForStartTime is null))
+                {
+                    ConsoleOutput.Error("--wait-for-pid and --wait-for-start-time must be provided together.");
+                    return 1;
+                }
+
+                if (passiveWait && waitForPid is null)
+                {
+                    ConsoleOutput.Error("--passive-wait requires --wait-for-pid and --wait-for-start-time.");
+                    return 1;
+                }
+
+                var localSource = Environment.GetEnvironmentVariable(UpdateSourceEnvVar);
+                if (!string.IsNullOrEmpty(localSource))
+                {
+                    if (!Directory.Exists(localSource))
+                    {
+                        ConsoleOutput.Error($"{UpdateSourceEnvVar} directory not found: {localSource}");
+                        return 1;
+                    }
+
+                    ConsoleOutput.Info($"Using local update source: {localSource}");
+                }
+
+                if (installStaged)
+                {
+                    if (!runtimeContext.SupportsInPlaceSelfUpdate() && runtimeContext.GetUnsupportedSelfUpdateReason() is { } reason)
+                    {
+                        ConsoleOutput.Error(reason);
+                        return 1;
+                    }
+
+                    if (dryRun)
+                    {
+                        ConsoleOutput.Info("[dry-run] Would install the staged update.");
+                        return 0;
+                    }
+
+                    return await HandleInstallStaged(updateService, stateStore, skipProvenance, waitForPid, waitForStartTime, passiveWait, ct);
+                }
+
+                if (check)
+                    return HandleCheckOnly(updateService, preRelease);
+
+                if (!runtimeContext.SupportsInPlaceSelfUpdate() && runtimeContext.GetUnsupportedSelfUpdateReason() is { } unsupportedReason)
+                {
+                    ConsoleOutput.Error(unsupportedReason);
+                    return 1;
+                }
+
+                return await HandleFullUpdate(updateService, stateStore, preRelease, skipProvenance, dryRun, ct);
+            }, logger);
+        });
+
+        return command;
+    }
+
+    private static async Task<int> HandleInstallStaged(
+        UpdateService updateService,
+        StateStore stateStore,
+        bool skipProvenance,
+        int? waitForPid,
+        DateTimeOffset? waitForStartTime,
+        bool passiveWait,
+        CancellationToken ct)
+    {
+        ConsoleOutput.Info("Installing staged update...");
+        var success = await updateService.InstallStagedAsync(
+            skipProvenance,
+            waitForPid,
+            waitForStartTime,
+            allowDaemonShutdown: !passiveWait,
+            ct);
+        if (success)
+        {
+            ConsoleOutput.Success("Update installed successfully.");
+            return 0;
+        }
+
+        var state = stateStore.LoadUpdateState();
+        ConsoleOutput.Error($"Update installation failed: {state.ErrorMessage ?? "unknown error"}");
+        ConsoleOutput.Info("Check the log file for details.");
+        return 1;
+    }
+
+    private static int HandleCheckOnly(UpdateService updateService, bool preRelease)
+    {
+        ConsoleOutput.Info("Checking for updates...");
+        var update = updateService.CheckForUpdate(preRelease);
+        if (update is null)
+        {
+            ConsoleOutput.Success($"{AppIdentity.CommandName} is up to date.");
+            return 0;
+        }
+
+        ConsoleOutput.Success($"Update available: {update.CurrentVersion} -> {update.AvailableVersion}");
+        ConsoleOutput.Info($"Run '{AppIdentity.CommandName} update' to install.");
+        return 0;
+    }
+
+    private static async Task<int> HandleFullUpdate(
+        UpdateService updateService,
+        StateStore stateStore,
+        bool preRelease,
+        bool skipProvenance,
+        bool dryRun,
+        CancellationToken ct)
+    {
+        ConsoleOutput.Info("Checking for updates...");
+        var update = updateService.CheckForUpdate(preRelease);
+        if (update is null)
+        {
+            ConsoleOutput.Success($"{AppIdentity.CommandName} is up to date.");
+            return 0;
+        }
+
+        ConsoleOutput.Info($"Update available: {update.CurrentVersion} -> {update.AvailableVersion}");
+
+        if (dryRun)
+        {
+            ConsoleOutput.Info("[dry-run] Would download, verify, and install this update.");
+            ConsoleOutput.Info($"[dry-run] Release tag: {update.ReleaseTag}, Dev build: {update.IsDevBuild}");
+            ConsoleOutput.Info($"[dry-run] Provenance verification: {(update.IsDevBuild || skipProvenance ? "skipped" : "enabled")}");
+            ConsoleOutput.Info("[dry-run] Checksum verification: enabled");
+            return 0;
+        }
+
+        if (!stateStore.TryAcquireUpdateLock())
+        {
+            ConsoleOutput.Error("Another update operation is already in progress.");
+            return 1;
+        }
+
+        bool staged;
+        ConsoleOutput.Info("Downloading and verifying update...");
+        try
+        {
+            staged = await updateService.DownloadAndStageAsync(update, skipProvenance, ct);
+        }
+        finally
+        {
+            stateStore.ReleaseUpdateLock();
+        }
+
+        if (!staged)
+        {
+            var state = stateStore.LoadUpdateState();
+            ConsoleOutput.Error($"Download/verification failed: {state.ErrorMessage ?? "unknown error"}");
+            ConsoleOutput.Info("Check the log file for details.");
+            return 1;
+        }
+
+        ConsoleOutput.Info("Installing update...");
+        var installed = await updateService.InstallStagedAsync(
+            skipProvenance,
+            waitForPid: null,
+            waitForStartTime: null,
+            allowDaemonShutdown: true,
+            ct);
+        if (!installed)
+        {
+            var state = stateStore.LoadUpdateState();
+            ConsoleOutput.Error($"Installation failed: {state.ErrorMessage ?? "unknown error"}");
+            ConsoleOutput.Info("Check the log file for details.");
+            return 1;
+        }
+
+        ConsoleOutput.Success($"{AppIdentity.CommandName} updated to {update.AvailableVersion}.");
+        return 0;
+    }
+}
