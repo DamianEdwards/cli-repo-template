@@ -92,7 +92,7 @@ jobs:
 
       - name: Validate shell script syntax
         shell: bash
-        run: ./scripts/verify-shell-syntax.sh
+        run: bash ./scripts/verify-shell-syntax.sh
 
   build:
     runs-on: ubuntu-latest
@@ -215,7 +215,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          ./scripts/update-dev-release.sh \
+          bash ./scripts/update-dev-release.sh \
             '${{ needs.version.outputs.dev_version }}' \
             './bundle/dev' \
             'Development channel build published from CI.'
@@ -265,4 +265,4 @@ jobs:
           set -euo pipefail
           mkdir -p ./artifacts/release-state
           printf '%s\n' '${{ needs.version.outputs.next_state }}' | jq -R 'split("|") | {base: .[0], phase: .[1], phaseNumber: (.[2] | tonumber), devNumber: (.[3] | tonumber), pending: .[4]}' > ./artifacts/release-state/version-state.json
-          ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Update release state after CI for ${{ needs.version.outputs.dev_version }}"
+          bash ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Update release state after CI for ${{ needs.version.outputs.dev_version }}"

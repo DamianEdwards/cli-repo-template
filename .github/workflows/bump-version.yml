@@ -73,7 +73,7 @@ jobs:
 
           mkdir -p ./artifacts/release-state
           printf '%s\n' "$NEW_STATE_JSON" > ./artifacts/release-state/version-state.json
-          ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Bump release state to ${{ github.event.inputs.phase }} (${DEV_VERSION} / ${RELEASE_VERSION})"
+          bash ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Bump release state to ${{ github.event.inputs.phase }} (${DEV_VERSION} / ${RELEASE_VERSION})"
 
           echo "## Release State Updated" >> "$GITHUB_STEP_SUMMARY"
           echo "- **State:** \`$(echo "$NEW_STATE_JSON" | jq -c '.')\`" >> "$GITHUB_STEP_SUMMARY"

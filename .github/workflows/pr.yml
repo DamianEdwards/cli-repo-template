@@ -33,7 +33,7 @@ jobs:
 
       - name: Validate shell script syntax
         shell: bash
-        run: ./scripts/verify-shell-syntax.sh
+        run: bash ./scripts/verify-shell-syntax.sh
 
   build:
     needs: [validate-powershell-scripts, validate-shell-scripts]

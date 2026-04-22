@@ -334,4 +334,4 @@ jobs:
 
           mkdir -p ./artifacts/release-state
           printf '%s\n' "$NEW_STATE_JSON" > ./artifacts/release-state/version-state.json
-          ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Advance release state after ${VERSION}"
+          bash ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Advance release state after ${VERSION}"
