@@ -201,6 +201,8 @@ assert_cosign_available() {
     echo '' >&2
     print_cosign_install_instructions
     echo '' >&2
+    echo 'To continue without provenance verification, rerun this script with --skip-provenance.' >&2
+    echo '' >&2
     exit 1
 }
 

@@ -1,5 +1,4 @@
 using System.CommandLine;
-using System.CommandLine.Completions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using TemplateCli.Commands;
@@ -66,21 +65,21 @@ public static class Program
 
     private static ServiceProvider ConfigureServices(LogLevel? consoleLogLevel)
     {
-        var serviceCollection = new ServiceCollection();
+        var services = new ServiceCollection();
 
-        serviceCollection.AddSingleton<LogFileManager>();
-        serviceCollection.AddLogging(builder => builder.SetMinimumLevel(LogLevel.Debug));
-        serviceCollection.AddSingleton<ILoggerProvider>(sp => new FileLoggerProvider(sp.GetRequiredService<LogFileManager>()));
+        services.AddSingleton<LogFileManager>();
+        services.AddLogging(builder => builder.SetMinimumLevel(LogLevel.Debug));
+        services.AddSingleton<ILoggerProvider>(sp => new FileLoggerProvider(sp.GetRequiredService<LogFileManager>()));
         if (consoleLogLevel is { } level)
-            serviceCollection.AddSingleton<ILoggerProvider>(_ => new StderrLoggerProvider(level));
+            services.AddSingleton<ILoggerProvider>(_ => new StderrLoggerProvider(level));
 
-        serviceCollection.AddSingleton<StateStore>();
-        serviceCollection.AddSingleton<GitHubReleaseService>();
-        serviceCollection.AddSingleton<ProvenanceVerifier>();
-        serviceCollection.AddSingleton<RuntimeContext>();
-        serviceCollection.AddSingleton<UpdateService>();
+        services.AddSingleton<StateStore>();
+        services.AddSingleton<GitHubReleaseService>();
+        services.AddSingleton<ProvenanceVerifier>();
+        services.AddSingleton<RuntimeContext>();
+        services.AddSingleton<UpdateService>();
 
-        return serviceCollection.BuildServiceProvider();
+        return services.BuildServiceProvider();
     }
 
     private static LogLevel? ParseLogLevel(string[] args, TemplateCliConfig config)
