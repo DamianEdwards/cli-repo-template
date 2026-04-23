@@ -1,0 +1,25 @@
+name: Validate file-based apps
+description: Setup .NET and build all C# file-based workflow helpers under scripts/.
+
+runs:
+  using: composite
+  steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Build C# file-based apps
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        files=(./scripts/*.cs)
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::No C# file-based apps were found under ./scripts."
+          exit 1
+        fi
+
+        for file in "${files[@]}"; do
+          dotnet build "$file"
+        done

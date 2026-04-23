@@ -42,25 +42,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
-        with:
-          dotnet-version: '10.0.x'
-
-      - name: Build C# file-based apps
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          files=(./scripts/*.cs)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::No C# file-based apps were found under ./scripts."
-            exit 1
-          fi
-
-          for file in "${files[@]}"; do
-            dotnet build "$file"
-          done
+      - name: Validate C# file-based apps
+        uses: ./.github/actions/validate-file-based-apps
 
   build:
     needs: [validate-powershell-scripts, validate-shell-scripts, validate-file-based-apps]
