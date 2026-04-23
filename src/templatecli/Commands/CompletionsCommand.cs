@@ -21,10 +21,22 @@ public static class CompletionsCommand
         shellArgument.CompletionSources.Add(_ => CompletionScripts.SupportedShells.Select(shell => new CompletionItem(shell)));
         scriptCommand.Arguments.Add(shellArgument);
 
+        var commandNameOption = new Option<string[]>("--command-name")
+        {
+            Description = "Command name to register the completion script for. Can be specified multiple times."
+        };
+        commandNameOption.AllowMultipleArgumentsPerToken = false;
+        scriptCommand.Options.Add(commandNameOption);
+
         scriptCommand.SetAction(parseResult =>
         {
             var shell = parseResult.GetValue(shellArgument) ?? CompletionScripts.GetDefaultShell();
-            if (!CompletionScripts.TryGenerate(shell, AppIdentity.CommandName, out var script, out var error))
+            var commandNames = parseResult.GetValue(commandNameOption);
+            var effectiveCommandNames = commandNames is { Length: > 0 }
+                ? commandNames
+                : [AppIdentity.CommandName];
+
+            if (!CompletionScripts.TryGenerate(shell, effectiveCommandNames, out var script, out var error))
             {
                 ConsoleOutput.Error(error);
                 return 1;

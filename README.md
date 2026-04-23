@@ -72,10 +72,12 @@ Supported keys:
 This template includes a built-in `completions script` command that emits shell completion scripts with no external dependency. The generated shell hooks call the CLI's own `System.CommandLine` `[suggest:<cursor>]` support, so users do not need `dotnet-suggest` or any other helper tool.
 
 ```text
-templatecli completions script [<bash|fish|pwsh|zsh>]
+templatecli completions script [<bash|fish|pwsh|zsh>] [--command-name <name>]...
 ```
 
 If no shell is specified, the command uses the detected current shell, defaulting to `pwsh` on Windows.
+
+If no `--command-name` values are supplied, the generated script registers completion for `templatecli`. Use `--command-name` to target alternate entry points such as local convenience run scripts.
 
 The install scripts automatically:
 
@@ -128,6 +130,8 @@ Build from the repo root:
 ```powershell
 .\build.ps1
 ```
+
+The repo-root build scripts also refresh shell-completion registration for the local source runners. `build.ps1` updates the current PowerShell session and persists the sourced completion file for future sessions. `build.sh` refreshes the sourced completion file under `.templatecli-home/completions` and ensures your shell profile loads it.
 
 Or directly:
 
