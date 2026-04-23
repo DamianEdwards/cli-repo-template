@@ -18,10 +18,11 @@ public static class UpdateCommand
         {
             Description = "Only check for updates without downloading or installing"
         };
-        var preReleaseOption = new Option<bool>("--pre-release", "-p")
+        var preReleaseOption = new Option<bool>("--pre-release")
         {
             Description = "Include pre-release versions as update candidates"
         };
+        preReleaseOption.Aliases.Add("-p");
         var stableOnlyOption = new Option<bool>("--stable-only")
         {
             Description = "Only consider stable releases, ignoring any configured pre-release default"
@@ -64,8 +65,8 @@ public static class UpdateCommand
                 var config = stateStore.LoadConfig();
 
                 var check = parseResult.GetValue(checkOption);
-                var usePreRelease = parseResult.GetResult(preReleaseOption) is not null;
-                var useStableOnly = parseResult.GetResult(stableOnlyOption) is not null;
+                var usePreRelease = parseResult.GetValue(preReleaseOption);
+                var useStableOnly = parseResult.GetValue(stableOnlyOption);
                 var skipProvenance = parseResult.GetValue(skipProvenanceOption);
                 var dryRun = parseResult.GetValue(dryRunOption);
                 var installStaged = parseResult.GetValue(installStagedOption);
@@ -81,9 +82,7 @@ public static class UpdateCommand
 
                 var preRelease = useStableOnly
                     ? false
-                    : usePreRelease
-                        ? parseResult.GetValue(preReleaseOption)
-                        : config.IncludePrereleaseUpdates;
+                    : usePreRelease || config.IncludePrereleaseUpdates;
 
                 DateTimeOffset? waitForStartTime = null;
                 if (!string.IsNullOrWhiteSpace(waitForStartTimeRaw))
