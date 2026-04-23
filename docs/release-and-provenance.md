@@ -76,11 +76,11 @@ If any are missing, the workflows log a warning and continue with unsigned artif
 
 The repo uses a mix of PowerShell and C# file-based apps for workflow support scripts:
 
-- `scripts\Merge-ReleaseBundle.cs`
-- `scripts\Update-ReleaseBundleMetadata.cs`
-- `scripts\Expand-WindowsReleaseAssets.cs`
-- `scripts\Compress-WindowsReleaseAssets.cs`
-- `scripts\Write-InstallScriptsManifest.cs`
+- `scripts\merge-release-bundle.cs`
+- `scripts\update-release-bundle-metadata.cs`
+- `scripts\expand-windows-release-assets.cs`
+- `scripts\compress-windows-release-assets.cs`
+- `scripts\write-install-scripts-manifest.cs`
 - `scripts\version.cs`
 
 These helpers are good C# candidates because they are workflow-only, cross-platform file/JSON/archive utilities with no dependency on PowerShell-specific runtime features.

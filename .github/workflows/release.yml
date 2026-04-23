@@ -147,7 +147,7 @@ jobs:
 
       - name: Expand Windows release assets
         shell: pwsh
-        run: dotnet ./scripts/Expand-WindowsReleaseAssets.cs -- --bundle-directory './artifacts/bundle' --working-directory './artifacts/windows-assets'
+        run: dotnet ./scripts/expand-windows-release-assets.cs -- --bundle-directory './artifacts/bundle' --working-directory './artifacts/windows-assets'
 
       - name: Determine signing availability
         id: signing
@@ -224,7 +224,7 @@ jobs:
       - name: Repack signed Windows assets
         if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
-        run: dotnet ./scripts/Compress-WindowsReleaseAssets.cs -- --working-directory './artifacts/windows-assets' --output-directory './artifacts/signed-windows-assets'
+        run: dotnet ./scripts/compress-windows-release-assets.cs -- --working-directory './artifacts/windows-assets' --output-directory './artifacts/signed-windows-assets'
 
       - name: Reuse unsigned Windows assets
         if: steps.signing.outputs.enabled != 'true'
@@ -274,7 +274,7 @@ jobs:
 
       - name: Regenerate release metadata
         shell: pwsh
-        run: dotnet ./scripts/Update-ReleaseBundleMetadata.cs -- --bundle-directory './artifacts/release'
+        run: dotnet ./scripts/update-release-bundle-metadata.cs -- --bundle-directory './artifacts/release'
 
       - name: Verify updated release metadata
         shell: bash

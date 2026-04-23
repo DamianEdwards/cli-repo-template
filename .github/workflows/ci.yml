@@ -228,7 +228,7 @@ jobs:
 
       - name: Create dev bundle
         shell: bash
-        run: dotnet ./scripts/Merge-ReleaseBundle.cs -- --input-directory './artifacts/dev' --output-directory './bundle/dev' --release-version '${{ needs.version.outputs.dev_version }}'
+        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/dev' --output-directory './bundle/dev' --release-version '${{ needs.version.outputs.dev_version }}'
 
       - name: Upload dev bundle artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -264,7 +264,7 @@ jobs:
 
       - name: Create promotable bundle
         shell: bash
-        run: dotnet ./scripts/Merge-ReleaseBundle.cs -- --input-directory './artifacts/promotable' --output-directory './bundle/promotable' --release-version '${{ needs.version.outputs.release_version }}'
+        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/promotable' --output-directory './bundle/promotable' --release-version '${{ needs.version.outputs.release_version }}'
 
       - name: Upload promotable bundle artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
