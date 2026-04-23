@@ -104,7 +104,7 @@ If you want to enable it manually later, generate a script and source it from yo
 
 - `src\templatecli` - sample CLI plus reusable infrastructure
 - `scripts\install` - Windows and Linux/macOS installers
-- `scripts` - publish, bundle, provenance, and validation helpers
+- `scripts` - publish, bundle, provenance, validation, and C# file-based workflow helpers
 - `.github\actions` - reusable composite actions for build/publish
 - `.github\workflows` - CI, PR, versioning, release, and installer publication workflows
 

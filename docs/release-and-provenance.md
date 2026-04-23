@@ -71,3 +71,20 @@ If any are missing, the workflows log a warning and continue with unsigned artif
 
 - `release-state` tracks the current mutable versioning state used by the workflows
 - `install-scripts` serves the latest published bootstrap scripts and is expected to be created/updated by the install-script publication workflow
+
+## Workflow helper implementation notes
+
+The repo uses a mix of PowerShell and C# file-based apps for workflow support scripts:
+
+- `scripts\Merge-ReleaseBundle.cs`
+- `scripts\Update-ReleaseBundleMetadata.cs`
+- `scripts\Expand-WindowsReleaseAssets.cs`
+- `scripts\Compress-WindowsReleaseAssets.cs`
+- `scripts\Write-InstallScriptsManifest.cs`
+- `scripts\version.cs`
+
+These helpers are good C# candidates because they are workflow-only, cross-platform file/JSON/archive utilities with no dependency on PowerShell-specific runtime features.
+
+The remaining PowerShell scripts stay in PowerShell for now because they are either user-facing shell entry points (`build.ps1`, `templatecli.ps1`), installer/shipping assets (`scripts\install\install-templatecli.ps1`), or closely tied to PowerShell-specific Authenticode/provenance behavior (`Generate-VerifyProvenance.ps1`, `Verify-WindowsBinaryIssuer.ps1`, `Test-InstallerProvenance.ps1`, `Verify-PowerShellSyntax.ps1`).
+
+`Publish-NativeAsset.ps1` remains the main workflow-only PowerShell candidate for a future pass. It does not ship to end users, but it still has more Windows-specific toolchain setup and external process orchestration than the helpers above.
