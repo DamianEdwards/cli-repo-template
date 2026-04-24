@@ -35,8 +35,18 @@ jobs:
         shell: bash
         run: bash ./scripts/verify-shell-syntax.sh
 
+  validate-file-based-apps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Validate C# file-based apps
+        uses: ./.github/actions/validate-file-based-apps
+
   build:
-    needs: [validate-powershell-scripts, validate-shell-scripts]
+    needs: [validate-powershell-scripts, validate-shell-scripts, validate-file-based-apps]
     runs-on: ubuntu-latest
 
     steps:

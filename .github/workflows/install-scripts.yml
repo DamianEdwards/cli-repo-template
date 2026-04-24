@@ -125,7 +125,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "install-scripts-v$(Get-Date -Format 'yyyy.MM.dd').${{ github.run_number }}"
-          ./scripts/Write-InstallScriptsManifest.ps1 -Directory './artifacts/install-script' -Version $version -SourceCommit '${{ github.sha }}' -SourceRef 'refs/heads/main'
+          dotnet ./scripts/write-install-scripts-manifest.cs -- --directory './artifacts/install-script' --manifest-version $version --source-commit '${{ github.sha }}' --source-ref 'refs/heads/main'
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Publish install-scripts branch and tag snapshot
