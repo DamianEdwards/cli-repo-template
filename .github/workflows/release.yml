@@ -290,7 +290,9 @@ jobs:
       - name: Attest final release archives
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
-          subject-path: ./artifacts/release/templatecli-*.zip,./artifacts/release/templatecli-*.tar.gz
+          subject-path: |
+            ./artifacts/release/templatecli-*.zip
+            ./artifacts/release/templatecli-*.tar.gz
 
       - name: Create GitHub release
         env:
