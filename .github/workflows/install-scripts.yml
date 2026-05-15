@@ -33,8 +33,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path ./artifacts/install-script -Force | Out-Null
+          New-Item -ItemType Directory -Path ./artifacts/install-script/.github/workflows -Force | Out-Null
           Copy-Item ./scripts/install/install-templatecli.ps1 ./artifacts/install-script/install.ps1 -Force
           Copy-Item ./scripts/install/install-templatecli.sh ./artifacts/install-script/install.sh -Force
+          Copy-Item ./.github/workflows/attest-install-scripts.yml ./artifacts/install-script/.github/workflows/attest-install-scripts.yml -Force
 
       - name: Determine signing availability
         id: signing
@@ -111,12 +113,12 @@ jobs:
           set -euo pipefail
 
           VERSION='${{ steps.manifest.outputs.version }}'
-          BRANCH_COMMIT=$(bash ./scripts/publish-branch-content.sh install-scripts ./artifacts/install-script "Publish ${VERSION}")
-
-          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
             echo "::error::Tag ${VERSION} already exists."
             exit 1
           fi
+
+          BRANCH_COMMIT=$(bash ./scripts/publish-branch-content.sh install-scripts ./artifacts/install-script "Publish ${VERSION}")
 
           git config user.name "${GIT_AUTHOR_NAME:-github-actions[bot]}"
           git config user.email "${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"

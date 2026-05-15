@@ -3,6 +3,10 @@ name: Attest Install Scripts
 on:
   workflow_dispatch:
 
+concurrency:
+  group: attest-install-scripts-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   attest-and-release:
     runs-on: ubuntu-latest
@@ -31,7 +35,9 @@ jobs:
       - name: Attest published install scripts
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
-          subject-path: ./install.sh,./install.ps1
+          subject-path: |
+            ./install.sh
+            ./install.ps1
 
       - name: Publish immutable install script snapshot
         env:

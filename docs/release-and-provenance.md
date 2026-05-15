@@ -33,7 +33,7 @@ This design supports both mutable and immutable consumption. The branch-backed U
 
 The `install-scripts` branch is treated as workflow-managed mutable state. Repositories created from this template typically will not have that branch yet unless the creator explicitly chose to include all branches, so the publication flow is expected to create `install-scripts` on first publish when it is missing. Subsequent publications add regular commits so the branch history is preserved. If repository permissions or branch protection prevent the workflow from creating or updating that branch, the workflow should fail with a clear, actionable error.
 
-`install-scripts.yml` uses the `production` environment for the single approval gate before signing keys are accessed or the public `install-scripts` branch and snapshot tag are updated. `attest-install-scripts.yml` intentionally remains ungated and only publishes attestations and the immutable release for the already-approved snapshot tag.
+`install-scripts.yml` uses the `production` environment for the single approval gate before signing keys are accessed or the public `install-scripts` branch and snapshot tag are updated. The published `install-scripts` snapshot also includes a copy of `.github\workflows\attest-install-scripts.yml` so GitHub can run that workflow on the tag-bound snapshot ref. `attest-install-scripts.yml` intentionally remains ungated and only publishes attestations and the immutable release for the already-approved snapshot tag.
 
 ## Required repository setup
 
