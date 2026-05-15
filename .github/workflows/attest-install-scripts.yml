@@ -1,0 +1,62 @@
+name: Attest Install Scripts
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: attest-install-scripts-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  attest-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Verify published install script files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f ./install.ps1
+          test -f ./install.sh
+          test -f ./install-scripts.json
+          test -f ./checksums.txt
+
+      - name: Attest published install scripts
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
+        with:
+          subject-path: |
+            ./install.sh
+            ./install.ps1
+
+      - name: Publish immutable install script snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='${{ github.ref_name }}'
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes
+          fi
+
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --latest=false \
+            --title "$TAG" \
+            --notes "Immutable install script snapshot published from the install-scripts branch." \
+            ./install.ps1 \
+            ./install.sh \
+            ./install-scripts.json \
+            ./checksums.txt
