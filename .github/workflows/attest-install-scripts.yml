@@ -31,6 +31,7 @@ jobs:
           test -f ./install.sh
           test -f ./install-scripts.json
           test -f ./checksums.txt
+          sha256sum --check ./checksums.txt
 
       - name: Attest published install scripts
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
