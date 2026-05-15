@@ -34,6 +34,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path ./artifacts/install-script -Force | Out-Null
           New-Item -ItemType Directory -Path ./artifacts/install-script/.github/workflows -Force | Out-Null
+          @(
+            '*.ps1 -text'
+            '*.sh text eol=lf'
+            '*.json text eol=lf'
+            '*.txt text eol=lf'
+            '.github/workflows/*.yml text eol=lf'
+          ) | Set-Content -Path ./artifacts/install-script/.gitattributes -Encoding utf8
           Copy-Item ./scripts/install/install-templatecli.ps1 ./artifacts/install-script/install.ps1 -Force
           Copy-Item ./scripts/install/install-templatecli.sh ./artifacts/install-script/install.sh -Force
           Copy-Item ./.github/workflows/attest-install-scripts.yml ./artifacts/install-script/.github/workflows/attest-install-scripts.yml -Force
