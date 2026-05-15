@@ -1,8 +1,8 @@
 {
-  "version": "install-scripts-v2026.05.15.3",
-  "sourceCommit": "30eceb1ee21e715f357adc5ed5438fa1183bbd53",
+  "version": "install-scripts-v2026.05.15.4",
+  "sourceCommit": "405ad659aa823406450c246900b689d98e2adee1",
   "sourceRef": "refs/heads/main",
-  "publishedAt": "2026-05-15T23:33:10.3991939\u002B00:00",
+  "publishedAt": "2026-05-15T23:54:33.4129268\u002B00:00",
   "scripts": [
     {
       "name": "install.ps1",

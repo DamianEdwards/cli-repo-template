@@ -1,0 +1,5 @@
+*.ps1 -text
+*.sh text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+.github/workflows/*.yml text eol=lf
