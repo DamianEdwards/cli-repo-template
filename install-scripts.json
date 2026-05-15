@@ -1,0 +1,16 @@
+{
+  "version": "install-scripts-v2026.05.15.1",
+  "sourceCommit": "8f18ba037556000310e4296e0d87e2979ceb2e30",
+  "sourceRef": "refs/heads/main",
+  "publishedAt": "2026-05-15T21:59:04.1085991\u002B00:00",
+  "scripts": [
+    {
+      "name": "install.ps1",
+      "sha256": "1187a8d86e7bfa64593cb5f7cba394a3217393cd1bbf95e76d86f9396fd1517b"
+    },
+    {
+      "name": "install.sh",
+      "sha256": "aebbcd48be8bff4ac0e9e5fb7a54958e65976ef48ced28f34a7c43e7615e16c9"
+    }
+  ]
+}
