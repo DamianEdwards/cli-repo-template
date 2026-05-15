@@ -31,7 +31,64 @@ Latest bootstrap URLs come from the branch, for example:
 
 This design supports both mutable and immutable consumption. The branch-backed URLs provide a convenient "latest" bootstrap entry point, while each publication also creates a tag-bound immutable snapshot release that consumers can pin to when they want a fixed install-script version.
 
-The `install-scripts` branch is treated as workflow-managed mutable state. Repositories created from this template typically will not have that branch yet unless the creator explicitly chose to include all branches, so the publication flow is expected to create `install-scripts` on first publish when it is missing. If repository permissions or branch protection prevent the workflow from creating or force-updating that branch, the workflow should fail with a clear, actionable error.
+The `install-scripts` branch is treated as workflow-managed mutable state. Repositories created from this template typically will not have that branch yet unless the creator explicitly chose to include all branches, so the publication flow is expected to create `install-scripts` on first publish when it is missing. Subsequent publications add regular commits so the branch history is preserved. If repository permissions or branch protection prevent the workflow from creating or updating that branch, the workflow should fail with a clear, actionable error.
+
+`install-scripts.yml` uses the `production` environment for the single approval gate before signing keys are accessed or the public `install-scripts` branch and snapshot tag are updated. `attest-install-scripts.yml` intentionally remains ungated and only publishes attestations and the immutable release for the already-approved snapshot tag.
+
+## Required repository setup
+
+Before publishing official releases or install scripts, configure the repository so the workflows can use the `production` environment and the workflow-managed branches and tags cannot be accidentally destroyed.
+
+### `production` environment
+
+Create a repository environment named `production`. This environment is the single approval gate for operations that either use signing credentials or publish public release/install assets.
+
+Recommended environment settings:
+
+- Add required reviewers for release/install publication approval.
+- If more than one reviewer is available, enable **Prevent self-review**.
+- Use **Selected branches and tags** for deployment branches/tags.
+- Allow the `main` branch so `install-scripts.yml` can publish install scripts.
+- Allow `v*` tags so `release.yml` can sign and publish official release assets.
+- Leave `install-scripts-v*` tags out unless `attest-install-scripts.yml` is later changed to use the `production` environment.
+- Disable administrator bypass if the approval gate should apply even to repository administrators; otherwise leave it enabled as an emergency escape hatch.
+
+### `install-scripts` branch ruleset
+
+Create a branch ruleset targeting exactly:
+
+```text
+install-scripts
+```
+
+The minimal ruleset that still allows the workflow to publish with the default `GITHUB_TOKEN` is:
+
+- **Restrict deletions**: enabled
+- **Block force pushes**: enabled
+- **Restrict creations**: disabled
+- **Restrict updates**: disabled
+- Bypass list: empty
+
+This protects the mutable installer branch from deletion and history rewrites while still allowing `install-scripts.yml` to create the branch on first publish and push regular history-preserving updates on subsequent publishes.
+
+To also block direct human pushes, use a dedicated machine identity instead of the default `GITHUB_TOKEN`: create a GitHub App or write deploy key, add that actor to the ruleset bypass list, store its credentials in the `production` environment, and have `install-scripts.yml` push with that token/key. Then enable **Restrict creations** and **Restrict updates** for the `install-scripts` ruleset.
+
+### Install-script snapshot tag ruleset
+
+Create a tag ruleset targeting:
+
+```text
+install-scripts-v*
+```
+
+Recommended rules:
+
+- **Restrict deletions**: enabled
+- **Restrict updates**: enabled
+- **Restrict creations**: disabled
+- Bypass list: empty
+
+`install-scripts.yml` creates a new snapshot tag for each publication and fails if the tag already exists, so updates and deletions should not be needed after creation.
 
 ## Optional repository configuration
 

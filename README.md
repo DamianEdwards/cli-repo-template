@@ -116,8 +116,9 @@ If you turn this into a real repository, start here:
 2. Update `Directory.Build.props` metadata, especially `RepositoryUrl`.
 3. Replace the sample commands in `Program.cs` and `Commands\`.
 4. Review installer defaults in `scripts\install\install-templatecli.ps1` and `install-templatecli.sh`.
-5. Update README examples and any remaining placeholder strings like `example/templatecli`.
-6. If you change persisted models, register them in `Models\JsonContext.cs`.
+5. Configure the `production` environment and installer branch/tag rulesets before first install-script publication.
+6. Update README examples and any remaining placeholder strings like `example/templatecli`.
+7. If you change persisted models, register them in `Models\JsonContext.cs`.
 
 ## Release, signing, and provenance
 
