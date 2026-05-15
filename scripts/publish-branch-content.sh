@@ -43,11 +43,10 @@ cp -R "$SOURCE_DIR"/. "$WORKTREE_DIR"/
 git -C "$WORKTREE_DIR" add -A
 
 if git -C "$WORKTREE_DIR" diff --cached --quiet; then
-  git -C "$WORKTREE_DIR" push origin "HEAD:${BRANCH}" --force >/dev/null
   git -C "$WORKTREE_DIR" rev-parse HEAD
   exit 0
 fi
 
 git -C "$WORKTREE_DIR" -c user.name="${GIT_AUTHOR_NAME:-github-actions[bot]}" -c user.email="${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}" commit -m "$COMMIT_MESSAGE" >/dev/null
-git -C "$WORKTREE_DIR" push origin "HEAD:${BRANCH}" --force >/dev/null
+git -C "$WORKTREE_DIR" push origin "HEAD:${BRANCH}" >/dev/null
 git -C "$WORKTREE_DIR" rev-parse HEAD
