@@ -1,0 +1,108 @@
+name: Releases Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_dev_releases:
+        description: Number of latest dev releases to keep.
+        required: false
+        default: '5'
+      keep_install_script_releases:
+        description: Number of latest install-script releases to keep.
+        required: false
+        default: '5'
+  schedule:
+    - cron: '37 4 * * 0'
+
+concurrency:
+  group: releases-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Delete old release snapshots
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_DEV_RELEASES: ${{ github.event.inputs.keep_dev_releases || '5' }}
+          KEEP_INSTALL_SCRIPT_RELEASES: ${{ github.event.inputs.keep_install_script_releases || '5' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validate_keep_count() {
+            local name="$1"
+            local value="$2"
+
+            if [[ ! "$value" =~ ^(0|[1-9][0-9]*)$ ]]; then
+              echo "::error::${name} must be a non-negative integer."
+              exit 1
+            fi
+          }
+
+          delete_releases() {
+            local label="$1"
+            local delete_tags="$2"
+            shift 2
+
+            local -a tags=("$@")
+
+            echo "## ${label}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${#tags[@]}" -eq 0 ]; then
+              echo "No releases to delete." >> "$GITHUB_STEP_SUMMARY"
+              return
+            fi
+
+            for tag in "${tags[@]}"; do
+              echo "Deleting ${tag}"
+              if [ "$delete_tags" = "true" ]; then
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+                echo "- Deleted release and tag \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+              else
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes
+                echo "- Deleted release \`${tag}\`" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
+          }
+
+          validate_keep_count "keep_dev_releases" "$KEEP_DEV_RELEASES"
+          validate_keep_count "keep_install_script_releases" "$KEEP_INSTALL_SCRIPT_RELEASES"
+
+          releases_json=$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,publishedAt \
+            --limit 1000)
+
+          mapfile -t dev_release_tags < <(jq -r --argjson keep "$KEEP_DEV_RELEASES" '
+            [
+              .[]
+              | select(.isDraft == false)
+              | select(.isPrerelease == true)
+              | select(
+                  .tagName
+                  | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-(pre|rc)\\.[0-9]+\\.dev\\.[0-9]+$|^v[0-9]+\\.[0-9]+\\.[0-9]+-rtm\\.dev\\.[0-9]+$")
+                )
+            ]
+            | sort_by(.publishedAt)
+            | reverse
+            | .[$keep:][]?.tagName
+          ' <<< "$releases_json")
+
+          mapfile -t install_script_release_tags < <(jq -r --argjson keep "$KEEP_INSTALL_SCRIPT_RELEASES" '
+            [
+              .[]
+              | select(.isDraft == false)
+              | select(.tagName | startswith("install-scripts-v"))
+            ]
+            | sort_by(.publishedAt)
+            | reverse
+            | .[$keep:][]?.tagName
+          ' <<< "$releases_json")
+
+          delete_releases "Dev releases" true "${dev_release_tags[@]}"
+          delete_releases "Install-script releases" false "${install_script_release_tags[@]}"

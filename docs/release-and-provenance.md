@@ -16,6 +16,7 @@ The template uses three release channels:
 - `publish-release.yml` is the admin-run promotion workflow; it chooses the current official version, creates the release tag, and dispatches `release.yml` on that tag ref
 - `release.yml` runs on the release tag ref, downloads the already-built CI bundle, signs Windows assets, regenerates metadata/checksums after signing, attests the final release archives, publishes the GitHub release, and advances `release-state`
 - `bump-version.yml` updates the mutable `release-state` branch when you want to move between `pre`, `rc`, and `rtm` lines or bump the base version ahead of the next CI/dev cycle
+- `releases-cleanup.yml` runs on a schedule or manually to delete old Dev releases and old install-script snapshot releases while keeping the latest five of each by default
 
 ## Install script publication
 
@@ -89,6 +90,8 @@ Recommended rules:
 - Bypass list: empty
 
 `install-scripts.yml` creates a new snapshot tag for each publication and fails if the tag already exists, so updates and deletions should not be needed after creation.
+
+`releases-cleanup.yml` deletes old install-script GitHub releases but intentionally leaves their protected snapshot tags in place. Dev cleanup deletes both the old Dev release and its tag because Dev tags are workflow-generated rolling build outputs.
 
 ## Optional repository configuration
 
