@@ -1,0 +1,129 @@
+name: Validate scripts
+description: Validate PowerShell scripts, shell scripts, and C# file-based apps when related files change.
+
+outputs:
+  should-run:
+    description: Whether script validation ran.
+    value: ${{ steps.changes.outputs.should-run }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect script validation changes
+      id: changes
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE_SHA: ${{ github.event.before }}
+        CURRENT_SHA: ${{ github.sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+
+        changed_files="${RUNNER_TEMP:-/tmp}/validate-scripts-changed-files.txt"
+        : > "$changed_files"
+
+        is_commit() {
+          git cat-file -e "$1^{commit}" >/dev/null 2>&1
+        }
+
+        detect_pr_changes() {
+          if is_commit "HEAD^1" && is_commit "HEAD^2" && git diff --name-only HEAD^1...HEAD^2 > "$changed_files"; then
+            return 0
+          fi
+
+          if [ -n "$PR_BASE_SHA" ] && [ -n "$PR_HEAD_SHA" ] && is_commit "$PR_BASE_SHA" && is_commit "$PR_HEAD_SHA" && git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA" > "$changed_files"; then
+            return 0
+          fi
+
+          return 1
+        }
+
+        detect_push_changes() {
+          local zero_sha="0000000000000000000000000000000000000000"
+          if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "$zero_sha" ] && is_commit "$BEFORE_SHA" && is_commit "$CURRENT_SHA" && git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" > "$changed_files"; then
+            return 0
+          fi
+
+          return 1
+        }
+
+        validate_all=false
+        case "$EVENT_NAME" in
+          pull_request|pull_request_target)
+            detect_pr_changes || validate_all=true
+            ;;
+          push)
+            detect_push_changes || validate_all=true
+            ;;
+          *)
+            validate_all=true
+            ;;
+        esac
+
+        if [ "$validate_all" = true ]; then
+          echo "::notice::Unable to determine changed files for this event; running all script validations."
+          echo "should-run=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        should_run=false
+        while IFS= read -r file; do
+          case "$file" in
+            scripts/*|.github/*|Directory.Build.props|Directory.Packages.props|global.json|nuget.config)
+              should_run=true
+              break
+              ;;
+          esac
+        done < "$changed_files"
+
+        if [ "$should_run" = true ]; then
+          echo "should-run=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::Script validation is required for changed script or workflow files."
+        else
+          echo "should-run=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::No script or workflow files changed; skipping script validation."
+        fi
+
+    - name: Setup .NET
+      if: steps.changes.outputs.should-run == 'true'
+      uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Validate PowerShell script syntax
+      if: steps.changes.outputs.should-run == 'true'
+      shell: pwsh
+      run: ./scripts/Verify-PowerShellSyntax.ps1
+
+    - name: Validate shell script syntax
+      if: steps.changes.outputs.should-run == 'true'
+      shell: bash
+      run: bash ./scripts/verify-shell-syntax.sh
+
+    - name: Build C# file-based apps
+      if: steps.changes.outputs.should-run == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        files=(./scripts/*.cs)
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "::error::No C# file-based apps were found under ./scripts."
+          exit 1
+        fi
+
+        max_parallel="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+        if ! [[ "$max_parallel" =~ ^[0-9]+$ ]] || [ "$max_parallel" -lt 1 ]; then
+          max_parallel=2
+        fi
+
+        echo "Building ${#files[@]} C# file-based app(s) with up to ${max_parallel} concurrent build(s)."
+        printf '%s\0' "${files[@]}" | xargs -0 -n 1 -P "$max_parallel" bash -c '
+          set -euo pipefail
+          file="$1"
+          echo "Building ${file}"
+          dotnet build "$file"
+        ' _

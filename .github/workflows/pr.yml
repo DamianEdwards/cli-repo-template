@@ -13,40 +13,19 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
 jobs:
-  validate-powershell-scripts:
+  validate-scripts:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
 
-      - name: Validate PowerShell script syntax
-        shell: pwsh
-        run: ./scripts/Verify-PowerShellSyntax.ps1
-
-  validate-shell-scripts:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Validate shell script syntax
-        shell: bash
-        run: bash ./scripts/verify-shell-syntax.sh
-
-  validate-file-based-apps:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Validate C# file-based apps
-        uses: ./.github/actions/validate-file-based-apps
+      - name: Validate scripts
+        uses: ./.github/actions/validate-scripts
 
   build:
-    needs: [validate-powershell-scripts, validate-shell-scripts, validate-file-based-apps]
     runs-on: ubuntu-latest
 
     steps:
