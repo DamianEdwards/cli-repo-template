@@ -3,6 +3,10 @@ param()
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'install\install-templatecli.ps1') -NoExecute
+if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not [System.IO.Path]::IsPathRooted($TargetPath))
+{
+    throw "The installer's default target path must be available on every host when helpers are loaded with -NoExecute."
+}
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("templatecli-payload-test-" + [guid]::NewGuid().ToString('N'))
 try
@@ -10,12 +14,15 @@ try
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $tempRoot 'templatecli.exe') -Value 'test'
     Set-Content -LiteralPath (Join-Path $tempRoot 'LICENSE') -Value 'test'
-    @{ files = @('LICENSE', 'templatecli.exe') } |
+    $dataDirectory = Join-Path $tempRoot 'data'
+    New-Item -ItemType Directory -Path $dataDirectory | Out-Null
+    Set-Content -LiteralPath (Join-Path $dataDirectory 'settings.json') -Value '{}'
+    @{ files = @('LICENSE', 'data/settings.json', 'templatecli.exe') } |
         ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $tempRoot 'payload-manifest.json')
 
     $files = @(Get-PayloadManifestFiles -PayloadRoot $tempRoot -RequireExactInventory)
-    if ($files.Count -ne 2 -or $files[0] -ne 'LICENSE' -or $files[1] -ne 'templatecli.exe')
+    if ($files.Count -ne 3 -or $files[0] -ne 'LICENSE' -or $files[1] -ne 'data/settings.json' -or $files[2] -ne 'templatecli.exe')
     {
         throw 'Valid payload manifest was not accepted.'
     }

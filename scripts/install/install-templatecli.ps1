@@ -5,7 +5,7 @@ param(
 
     [switch]$Force,
 
-    [string]$TargetPath = (Join-Path $env:USERPROFILE '.templatecli\bin'),
+    [string]$TargetPath = (Join-Path ([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)) '.templatecli/bin'),
 
     [bool]$UpdatePath = $true,
 
@@ -37,7 +37,7 @@ else
     [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
 }
 
-if (-not $runningOnWindows)
+if (-not $runningOnWindows -and -not $NoExecute)
 {
     $scriptName = if ($MyInvocation.MyCommand.Name) { $MyInvocation.MyCommand.Name } else { 'install-templatecli.ps1' }
     Write-Error "$scriptName currently supports Windows only. Running on '$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)' is not yet supported."
@@ -662,7 +662,9 @@ function Get-PayloadManifestFiles
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     $files = @($manifest.files)
     if ($files.Count -eq 0) { throw 'payload-manifest.json contains no files.' }
-    $root = [System.IO.Path]::GetFullPath($PayloadRoot).TrimEnd('\') + '\'
+    $root = [System.IO.Path]::GetFullPath($PayloadRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
     $seen = @{}
     $previous = $null
     foreach ($file in $files)
@@ -675,7 +677,8 @@ function Get-PayloadManifestFiles
         {
             throw 'Payload manifest must be sorted and contain unique paths.'
         }
-        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $PayloadRoot $file.Replace('/', '\')))
+        $nativePath = $file.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $PayloadRoot $nativePath))
         if (-not $fullPath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $fullPath -PathType Leaf))
         {
             throw "Payload manifest entry '$file' is missing or outside the payload."
@@ -686,7 +689,7 @@ function Get-PayloadManifestFiles
     if (-not $seen.ContainsKey('templatecli.exe')) { throw "Payload manifest does not include 'templatecli.exe'." }
     if ($RequireExactInventory)
     {
-        $actual = @(Get-ChildItem -LiteralPath $PayloadRoot -File -Recurse |
+        [string[]]$actual = @(Get-ChildItem -LiteralPath $PayloadRoot -File -Recurse |
                 ForEach-Object { $_.FullName.Substring($root.Length).Replace('\', '/') } |
                 Where-Object { $_ -ne 'payload-manifest.json' })
         [System.Array]::Sort($actual, [System.StringComparer]::Ordinal)
@@ -737,21 +740,27 @@ function Install-TemplateCliPayload
     New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
     foreach ($file in $managedFiles)
     {
-        $installedPath = Join-Path $InstallRoot $file.Replace('/', '\')
+        $nativePath = $file.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+        $installedPath = Join-Path $InstallRoot $nativePath
         if (Test-Path -LiteralPath $installedPath -PathType Leaf)
         {
-            $backupPath = Join-Path $BackupRoot $file.Replace('/', '\')
+            $backupPath = Join-Path $BackupRoot $nativePath
             New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($backupPath)) -Force | Out-Null
             Copy-Item -LiteralPath $installedPath -Destination $backupPath -Force
         }
     }
     try
     {
-        foreach ($file in $managedFiles) { Remove-Item -LiteralPath (Join-Path $InstallRoot $file.Replace('/', '\')) -Force -ErrorAction SilentlyContinue }
+        foreach ($file in $managedFiles)
+        {
+            $nativePath = $file.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            Remove-Item -LiteralPath (Join-Path $InstallRoot $nativePath) -Force -ErrorAction SilentlyContinue
+        }
         foreach ($file in $newFiles)
         {
-            $source = Join-Path $PayloadRoot $file.Replace('/', '\')
-            $destination = Join-Path $InstallRoot $file.Replace('/', '\')
+            $nativePath = $file.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            $source = Join-Path $PayloadRoot $nativePath
+            $destination = Join-Path $InstallRoot $nativePath
             New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
             Copy-Item -LiteralPath $source -Destination $destination -Force
         }
@@ -761,11 +770,18 @@ function Install-TemplateCliPayload
     }
     catch
     {
-        foreach ($file in $managedFiles) { Remove-Item -LiteralPath (Join-Path $InstallRoot $file.Replace('/', '\')) -Force -ErrorAction SilentlyContinue }
+        foreach ($file in $managedFiles)
+        {
+            $nativePath = $file.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            Remove-Item -LiteralPath (Join-Path $InstallRoot $nativePath) -Force -ErrorAction SilentlyContinue
+        }
         if (Test-Path -LiteralPath $BackupRoot)
         {
             Get-ChildItem -LiteralPath $BackupRoot -File -Recurse | ForEach-Object {
-                $relative = $_.FullName.Substring(([System.IO.Path]::GetFullPath($BackupRoot).TrimEnd('\') + '\').Length)
+                $backupPrefix = [System.IO.Path]::GetFullPath($BackupRoot).TrimEnd(
+                    [System.IO.Path]::DirectorySeparatorChar,
+                    [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+                $relative = $_.FullName.Substring($backupPrefix.Length)
                 $destination = Join-Path $InstallRoot $relative
                 New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
                 Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
