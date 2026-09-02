@@ -317,7 +317,8 @@ get_release_for_quality() {
     local all_releases
     all_releases=$(invoke_github_api "https://api.github.com/repos/${repo}/releases?per_page=100")
 
-    local candidate_release=""
+    local best_release=""
+    local best_version=""
     local release_count
     release_count=$(echo "$all_releases" | jq 'length')
 
@@ -349,36 +350,24 @@ get_release_for_quality() {
             is_dev_release=true
         fi
 
-        if [[ "$selected_quality" == "Dev" ]]; then
-            if [[ "$is_prerelease" == "true" && "$is_dev_release" == "true" ]]; then
-                echo "$release"
-                return
-            fi
-            continue
-        fi
+        local matches=false
+        case "$selected_quality" in
+            Dev) [[ "$is_prerelease" == "true" && "$is_dev_release" == "true" ]] && matches=true ;;
+            PreRelease) [[ "$is_dev_release" == "false" ]] && matches=true ;;
+            Stable) [[ "$is_prerelease" == "false" ]] && matches=true ;;
+        esac
+        [[ "$matches" == true ]] || continue
 
-        if [[ "$selected_quality" == "PreRelease" ]]; then
-            if [[ "$is_prerelease" == "true" && "$is_dev_release" == "false" ]]; then
-                echo "$release"
-                return
-            fi
-            continue
+        local version="${tag_name#v}"
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?$ ]] || continue
+        if [[ -z "$best_release" || "$(compare_semantic_version "$version" "$best_version")" == "1" ]]; then
+            best_release="$release"
+            best_version="$version"
         fi
-
-        if [[ "$selected_quality" == "Stable" && "$is_prerelease" == "true" ]]; then
-            if [[ "$is_dev_release" == "false" && -z "$candidate_release" ]]; then
-                candidate_release="$release"
-            fi
-            continue
-        fi
-
-        echo "$release"
-        return
     done
 
-    if [[ "$selected_quality" == "Stable" && -n "$candidate_release" ]]; then
-        echo "Warning: No stable release containing '$asset_name' was found. Falling back to latest prerelease." >&2
-        echo "$candidate_release"
+    if [[ -n "$best_release" ]]; then
+        echo "$best_release"
         return
     fi
 
@@ -392,7 +381,7 @@ get_expected_sha256() {
     local asset_name="$2"
 
     local line
-    line=$(grep -E "\s\*?${asset_name}$" "$checksums_path" | head -n 1)
+    line=$(grep -E "[[:space:]]\*?${asset_name}$" "$checksums_path" | head -n 1 || true)
 
     if [[ -z "$line" ]]; then
         die "checksums.txt did not contain an entry for '$asset_name'."
@@ -419,7 +408,7 @@ assert_archive_integrity() {
     expected_sha=$(get_expected_sha256 "$checksums_path" "$asset_name")
 
     local actual_sha
-    actual_sha=$(shasum -a 256 "$archive_path" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+    actual_sha=$(compute_sha256 "$archive_path")
 
     log_verbose "checksums.txt expected SHA256 for '$asset_name': '$expected_sha'."
     log_verbose "Actual SHA256 for '$archive_path': '$actual_sha'."
@@ -454,7 +443,11 @@ escape_regex() {
 
 compute_sha256() {
     local file_path="$1"
-    shasum -a 256 "$file_path" | awk '{print tolower($1)}'
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file_path" | awk '{print tolower($1)}'
+    else
+        shasum -a 256 "$file_path" | awk '{print tolower($1)}'
+    fi
 }
 
 download_attestation_bundle() {
@@ -474,7 +467,7 @@ download_attestation_bundle() {
         die "Failed to compute SHA256 for '$file_path'."
     fi
 
-    local url="https://api.github.com/repos/${owner}/${repo_name}/dependency-graph/artifact-attestations/sha256/${digest}/bundle"
+    die "Portable release-local attestations are required; live attestation bundle lookup is unsupported."
     local response_path="${bundle_path}.response"
     local http_code
     local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
@@ -524,10 +517,10 @@ assert_artifact_attestation() {
     local repo="$2"
     local description="${3:-artifact}"
     local expected_ref="$4"
+    local bundles_path="$5"
 
     log_verbose "Verifying $description attestation for '$file_path' from '$repo' at '$expected_ref'."
-    local bundle_path="${file_path}.sigstore.json"
-    download_attestation_bundle "$file_path" "$repo" "$bundle_path"
+    [[ -s "$bundles_path" ]] || die "Release does not contain a portable Sigstore attestation bundle."
 
     local repo_pattern
     repo_pattern=$(escape_regex "$repo")
@@ -537,21 +530,25 @@ assert_artifact_attestation() {
     local expected_ref_pattern
     expected_ref_pattern=$(escape_regex "$expected_ref")
     local identity_pattern="^https://github\\.com/${repo_pattern}/\\.github/workflows/${workflow_pattern}@${expected_ref_pattern}$"
-    local output
-    output=$(cosign verify-blob-attestation \
-        --bundle "$bundle_path" \
-        --new-bundle-format \
-        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-        --certificate-identity-regexp "$identity_pattern" \
-        "$file_path" 2>&1) || last_error="$output"
-
-    if [[ -z "${last_error:-}" ]]; then
-        log_verbose "Artifact attestation verification succeeded for $description '$file_path'."
+    local index=0 bundle_json output
+    while IFS= read -r bundle_json; do
+        [[ -n "$bundle_json" ]] || continue
+        local bundle_path="${file_path}.bundle.${index}.json"
+        printf '%s\n' "$bundle_json" > "$bundle_path"
+        if output=$(cosign verify-blob-attestation \
+            --bundle "$bundle_path" \
+            --new-bundle-format \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "$identity_pattern" \
+            "$file_path" 2>&1); then
+            rm -f "$bundle_path"
+            log_verbose "$output"
+            return
+        fi
+        last_error="$output"
         rm -f "$bundle_path"
-        return
-    fi
-
-    rm -f "$bundle_path"
+        index=$((index + 1))
+    done < <(jq -c '.' "$bundles_path")
     die "Artifact attestation verification failed for $description '$file_path': ${last_error:-Cosign did not find a matching attestation bundle.}"
 }
 
@@ -959,6 +956,20 @@ expand_release_archive() {
 
     log_verbose "Expanding '$archive_path' to '$dest_path'."
     mkdir -p "$dest_path"
+    local entry
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        case "$entry" in
+            /*|../*|*/../*|*/..) die "Archive contains unsafe path '$entry'." ;;
+        esac
+    done < <(tar -tzf "$archive_path")
+    local type
+    while IFS= read -r type; do
+        case "$type" in
+            -|d) ;;
+            *) die "Archive contains a link or unsupported entry type '$type'." ;;
+        esac
+    done < <(tar -tvzf "$archive_path" | cut -c1)
     tar -xzf "$archive_path" -C "$dest_path"
 
     local binary_path="${dest_path}/templatecli"
@@ -967,8 +978,100 @@ expand_release_archive() {
     fi
 
     chmod +x "$binary_path"
+    validate_payload_manifest "$dest_path"
     log_verbose "Found extracted binary '$binary_path'."
     echo "$binary_path"
+}
+
+validate_payload_manifest() {
+    local payload_root="$1"
+    local manifest_path="${payload_root}/payload-manifest.json"
+    [[ -f "$manifest_path" ]] || die "Downloaded archive did not contain payload-manifest.json."
+    jq -e '.files | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' "$manifest_path" >/dev/null \
+        || die "payload-manifest.json is invalid."
+
+    local declared=() actual=() previous="" item
+    while IFS= read -r item; do
+        [[ "$item" != /* && "$item" != *\\* ]] || die "Payload manifest contains unsafe path '$item'."
+        case "$item" in ../*|*/../*|*/..) die "Payload manifest contains unsafe path '$item'." ;; esac
+        [[ -z "$previous" || "$previous" < "$item" ]] || die "Payload manifest must be sorted and contain unique paths."
+        [[ -f "${payload_root}/${item}" && ! -L "${payload_root}/${item}" ]] || die "Payload manifest entry '$item' is missing or unsupported."
+        declared+=("$item")
+        previous="$item"
+    done < <(jq -r '.files[]' "$manifest_path")
+    [[ " ${declared[*]} " == *" templatecli "* ]] || die "Payload manifest does not include templatecli."
+    while IFS= read -r item; do
+        [[ "$item" == "payload-manifest.json" ]] || actual+=("$item")
+    done < <(cd "$payload_root" && find . -type f -print | sed 's#^\./##' | LC_ALL=C sort)
+    [[ "${#declared[@]}" -eq "${#actual[@]}" ]] || die "Payload manifest does not exactly match the archive."
+    local index
+    for ((index=0; index<${#declared[@]}; index++)); do
+        [[ "${declared[$index]}" == "${actual[$index]}" ]] || die "Payload manifest does not exactly match the archive."
+    done
+}
+
+install_payload() {
+    local payload_root="$1"
+    local install_root="$2"
+    local desired_version="$3"
+    local manifest_path="${payload_root}/payload-manifest.json"
+    local installed_manifest="${install_root}/payload-manifest.json"
+    local backup_root="${TEMPLATECLI_INSTALL_TEMP_ROOT}/backup"
+    local new_files=() old_files=() managed_files=() item
+    while IFS= read -r item; do new_files+=("$item"); done < <(jq -r '.files[]' "$manifest_path")
+    if [[ -f "$installed_manifest" ]]; then
+        while IFS= read -r item; do
+            case "$item" in /*|../*|*/../*|*/..|*\\*) die "Installed payload manifest contains unsafe path '$item'." ;; esac
+            old_files+=("$item")
+        done < <(jq -r '.files[]' "$installed_manifest")
+    elif [[ -f "${install_root}/templatecli" ]]; then
+        old_files+=("templatecli")
+    fi
+    managed_files=(${new_files[@]+"${new_files[@]}"} ${old_files[@]+"${old_files[@]}"} "payload-manifest.json")
+    mkdir -p "$backup_root"
+    local unique_file
+    while IFS= read -r unique_file; do
+        [[ -n "$unique_file" ]] || continue
+        if [[ -f "${install_root}/${unique_file}" ]]; then
+            mkdir -p "${backup_root}/$(dirname "$unique_file")"
+            cp -p "${install_root}/${unique_file}" "${backup_root}/${unique_file}" || return 1
+        fi
+    done < <(printf '%s\n' ${managed_files[@]+"${managed_files[@]}"} | LC_ALL=C sort -u)
+
+    local failed=false
+    while IFS= read -r unique_file; do
+        [[ -n "$unique_file" ]] || continue
+        rm -f "${install_root}/${unique_file}" || { failed=true; break; }
+    done < <(printf '%s\n' ${managed_files[@]+"${managed_files[@]}"} | LC_ALL=C sort -u)
+    if [[ "$failed" == false ]]; then
+        for item in ${new_files[@]+"${new_files[@]}"}; do
+            mkdir -p "${install_root}/$(dirname "$item")"
+            cp -p "${payload_root}/${item}" "${install_root}/${item}" || { failed=true; break; }
+        done
+    fi
+    if [[ "$failed" == false ]]; then
+        cp -p "$manifest_path" "$installed_manifest" || failed=true
+        chmod +x "${install_root}/templatecli" || failed=true
+    fi
+    if [[ "$failed" == false ]]; then
+        local smoke_version=""
+        smoke_version=$(get_templatecli_version_string "${install_root}/templatecli") || failed=true
+        [[ "$smoke_version" == "$desired_version" ]] || failed=true
+    fi
+    if [[ "$failed" == true ]]; then
+        while IFS= read -r unique_file; do
+            [[ -n "$unique_file" ]] || continue
+            rm -f "${install_root}/${unique_file}" || true
+        done < <(printf '%s\n' ${managed_files[@]+"${managed_files[@]}"} | LC_ALL=C sort -u)
+        if [[ -d "$backup_root" ]]; then
+            (cd "$backup_root" && find . -type f -print | while IFS= read -r item; do
+                item="${item#./}"
+                mkdir -p "${install_root}/$(dirname "$item")"
+                cp -p "${backup_root}/${item}" "${install_root}/${item}"
+            done)
+        fi
+        return 1
+    fi
 }
 
 # ─── Main install ────────────────────────────────────────────────────────────
@@ -1000,19 +1103,6 @@ install_templatecli() {
         assert_cosign_available
     fi
 
-    if [[ "$QUALITY" == "Dev" && "$FORCE" != true ]]; then
-        if [[ -e /dev/tty ]]; then
-            printf "Dev quality disables checksum/provenance verification. Type YES to continue: "
-            local confirmation
-            read -r confirmation < /dev/tty
-            if [[ "$confirmation" != "YES" ]]; then
-                die "Installation canceled by user."
-            fi
-        else
-            die "Dev quality requires --force when running in non-interactive mode (no terminal available)."
-        fi
-    fi
-
     TEMPLATECLI_INSTALL_TEMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/templatecli-install-XXXXXX")
     local temp_root="$TEMPLATECLI_INSTALL_TEMP_ROOT"
     local download_path="${temp_root}/${asset_name}"
@@ -1034,41 +1124,44 @@ install_templatecli() {
     status_step "Downloading ${release_status_label}" \
         invoke_github_asset_download "$asset_url" "$asset_name" "$temp_root"
 
+    # Checksums and metadata are mandatory for every channel, including Dev.
+    if ! has_release_asset "$release" "checksums.txt" || ! has_release_asset "$release" "release-metadata.json"; then
+        die "Release '$release_tag' must include checksums.txt and release-metadata.json."
+    fi
+
+    local checksums_path="${temp_root}/checksums.txt"
+    local checksums_url
+    checksums_url=$(get_release_asset_url "$release" "checksums.txt")
+    invoke_github_asset_download "$checksums_url" "checksums.txt" "$temp_root"
+
+    local release_metadata_path="${temp_root}/release-metadata.json"
+    local release_metadata_url
+    release_metadata_url=$(get_release_asset_url "$release" "release-metadata.json")
+    invoke_github_asset_download "$release_metadata_url" "release-metadata.json" "$temp_root"
+    jq -e --arg version "${release_tag#v}" --arg asset "$asset_name" '
+        .version == $version
+        and (.sourceCommit | type == "string" and test("^[0-9a-fA-F]{40}$"))
+        and ([.assets[].name] | length == (unique | length))
+        and ([.assets[] | select(.name == $asset and (.sha256 | test("^[0-9a-fA-F]{64}$")))] | length == 1)
+    ' "$release_metadata_path" >/dev/null || die "release-metadata.json is invalid or does not bind '$asset_name' to '$release_tag'."
+
+    status_step "Verifying asset checksums" \
+        assert_archive_integrity "$download_path" "$asset_name" "$checksums_path" "$release_metadata_path"
+
     if [[ "$QUALITY" != "Dev" ]]; then
-        # Download and verify checksums
-        if ! has_release_asset "$release" "checksums.txt"; then
-            die "Release '$release_tag' did not include checksums.txt."
-        fi
-
-        local checksums_path="${temp_root}/checksums.txt"
-        log_verbose "Downloading checksums from release '$release_tag' to '$checksums_path'."
-        local checksums_url
-        checksums_url=$(get_release_asset_url "$release" "checksums.txt")
-        [[ -n "$checksums_url" ]] || die "Release '$release_tag' did not include checksums.txt."
-        invoke_github_asset_download "$checksums_url" "checksums.txt" "$temp_root"
-
-        local release_metadata_path=""
-        if has_release_asset "$release" "release-metadata.json"; then
-            release_metadata_path="${temp_root}/release-metadata.json"
-            log_verbose "Downloading release metadata from release '$release_tag' to '$release_metadata_path'."
-            local release_metadata_url
-            release_metadata_url=$(get_release_asset_url "$release" "release-metadata.json")
-            [[ -n "$release_metadata_url" ]] || die "Release '$release_tag' did not include release-metadata.json."
-            invoke_github_asset_download "$release_metadata_url" "release-metadata.json" "$temp_root"
-        fi
-
-        status_step "Verifying asset checksums" \
-            assert_archive_integrity "$download_path" "$asset_name" "$checksums_path" "$release_metadata_path"
-
-        # Verify artifact attestation
         if [[ "$SKIP_PROVENANCE" == true ]]; then
             echo "Skipping provenance verification (--skip-provenance)."
         else
+            has_release_asset "$release" "attestations.jsonl" || die "Release '$release_tag' did not include attestations.jsonl."
+            local attestations_path="${temp_root}/attestations.jsonl"
+            local attestations_url
+            attestations_url=$(get_release_asset_url "$release" "attestations.jsonl")
+            invoke_github_asset_download "$attestations_url" "attestations.jsonl" "$temp_root"
             status_step "Verifying archive provenance" \
-                assert_artifact_attestation "$download_path" "$REPOSITORY" "archive" "refs/tags/${release_tag}"
+                assert_artifact_attestation "$download_path" "$REPOSITORY" "archive" "refs/tags/${release_tag}" "$attestations_path"
         fi
     else
-        echo "Skipping checksum and provenance verification for development build."
+        echo "Skipping provenance verification for development build; checksums remain enforced."
     fi
 
     local downloaded_binary_path
@@ -1104,8 +1197,7 @@ install_templatecli() {
 
     if [[ "$should_install" == true ]]; then
         status_step "Installing ${downloaded_version} to '${install_directory}'" \
-            cp "$downloaded_binary_path" "$destination_path"
-        chmod +x "$destination_path"
+            install_payload "$extract_path" "$install_directory" "$downloaded_version"
     fi
 
     if [[ "$UPDATE_PATH" == true ]]; then

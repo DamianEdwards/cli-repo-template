@@ -387,7 +387,7 @@ function Get-ReleaseForQuality
         {
             if ($release.prerelease -and $isDevRelease)
             {
-                return $release
+                $candidateReleases += $release
             }
 
             continue
@@ -395,34 +395,38 @@ function Get-ReleaseForQuality
 
         if ($SelectedQuality -eq 'PreRelease')
         {
-            if ($release.prerelease -and -not $isDevRelease)
+            if (-not $isDevRelease)
             {
-                return $release
+                $candidateReleases += $release
             }
 
             continue
         }
 
-        if ($SelectedQuality -eq 'Stable' -and $release.prerelease)
+        if ($SelectedQuality -eq 'Stable')
         {
-            if (-not $isDevRelease)
+            if (-not $release.prerelease)
             {
-                # Track as fallback candidate but keep looking for a stable release
                 $candidateReleases += $release
             }
             continue
         }
-
-        return $release
     }
 
-    # When looking for Stable and none found, fall back to the latest prerelease
-    if ($SelectedQuality -eq 'Stable' -and $candidateReleases.Count -gt 0)
+    $bestRelease = $null
+    $bestVersion = $null
+    foreach ($candidate in $candidateReleases)
     {
-        Write-Warning "No stable release containing '$AssetName' was found. Falling back to latest prerelease."
-        return $candidateReleases[0]
+        $candidateVersion = $candidate.tag_name -replace '^v', ''
+        try { $null = Parse-SemanticVersion -Value $candidateVersion } catch { continue }
+        if ($null -eq $bestRelease -or (Compare-SemanticVersion -Left $candidateVersion -Right $bestVersion) -gt 0)
+        {
+            $bestRelease = $candidate
+            $bestVersion = $candidateVersion
+        }
     }
 
+    if ($null -ne $bestRelease) { return $bestRelease }
     throw "No '$SelectedQuality' release containing '$AssetName' was found in '$Repo'."
 }
 
@@ -593,7 +597,44 @@ function Expand-WindowsReleaseArchive
     )
 
     Write-Verbose "Expanding '$ArchivePath' to '$DestinationPath'."
-    Expand-Archive -Path $ArchivePath -DestinationPath $DestinationPath -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+    $root = [System.IO.Path]::GetFullPath($DestinationPath).TrimEnd('\') + '\'
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try
+    {
+        foreach ($entry in $archive.Entries)
+        {
+            $entryName = $entry.FullName.Replace('/', '\')
+            if ([System.IO.Path]::IsPathRooted($entryName) -or $entryName -match '(^|\\)\.\.(\\|$)')
+            {
+                throw "Archive contains unsafe path '$($entry.FullName)'."
+            }
+            $unixType = ($entry.ExternalAttributes -shr 16) -band 0xF000
+            if ($unixType -eq 0xA000)
+            {
+                throw "Archive contains unsupported symbolic link '$($entry.FullName)'."
+            }
+            $destination = [System.IO.Path]::GetFullPath((Join-Path $DestinationPath $entryName))
+            if (-not $destination.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase))
+            {
+                throw "Archive entry '$($entry.FullName)' escapes the extraction directory."
+            }
+            if ([string]::IsNullOrEmpty($entry.Name))
+            {
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+            }
+            else
+            {
+                New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $true)
+            }
+        }
+    }
+    finally
+    {
+        $archive.Dispose()
+    }
 
     $binaryPath = Join-Path $DestinationPath 'templatecli.exe'
     if (-not (Test-Path $binaryPath))
@@ -601,8 +642,137 @@ function Expand-WindowsReleaseArchive
         throw "Downloaded archive '$([System.IO.Path]::GetFileName($ArchivePath))' did not contain 'templatecli.exe'."
     }
 
+    $null = Get-PayloadManifestFiles -PayloadRoot $DestinationPath -RequireExactInventory
     Write-Verbose "Found extracted Windows binary '$binaryPath'."
     return $binaryPath
+}
+
+function Get-PayloadManifestFiles
+{
+    param(
+        [Parameter(Mandatory)][string]$PayloadRoot,
+        [switch]$RequireExactInventory
+    )
+
+    $manifestPath = Join-Path $PayloadRoot 'payload-manifest.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf))
+    {
+        throw "Payload does not contain payload-manifest.json."
+    }
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    $files = @($manifest.files)
+    if ($files.Count -eq 0) { throw 'payload-manifest.json contains no files.' }
+    $root = [System.IO.Path]::GetFullPath($PayloadRoot).TrimEnd('\') + '\'
+    $seen = @{}
+    $previous = $null
+    foreach ($file in $files)
+    {
+        if ([string]::IsNullOrWhiteSpace($file) -or [System.IO.Path]::IsPathRooted($file) -or $file.Contains('\') -or $file -match '(^|/)\.\.(/|$)')
+        {
+            throw "Payload manifest contains unsafe path '$file'."
+        }
+        if ($null -ne $previous -and [string]::CompareOrdinal($previous, $file) -ge 0)
+        {
+            throw 'Payload manifest must be sorted and contain unique paths.'
+        }
+        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $PayloadRoot $file.Replace('/', '\')))
+        if (-not $fullPath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath $fullPath -PathType Leaf))
+        {
+            throw "Payload manifest entry '$file' is missing or outside the payload."
+        }
+        $seen[$file] = $true
+        $previous = $file
+    }
+    if (-not $seen.ContainsKey('templatecli.exe')) { throw "Payload manifest does not include 'templatecli.exe'." }
+    if ($RequireExactInventory)
+    {
+        $actual = @(Get-ChildItem -LiteralPath $PayloadRoot -File -Recurse |
+                ForEach-Object { $_.FullName.Substring($root.Length).Replace('\', '/') } |
+                Where-Object { $_ -ne 'payload-manifest.json' })
+        [System.Array]::Sort($actual, [System.StringComparer]::Ordinal)
+        if ($actual.Count -ne $files.Count)
+        {
+            throw 'Payload manifest does not exactly match the archive.'
+        }
+        for ($index = 0; $index -lt $files.Count; $index++)
+        {
+            if (-not [string]::Equals($actual[$index], $files[$index], [System.StringComparison]::Ordinal))
+            {
+                throw 'Payload manifest does not exactly match the archive.'
+            }
+        }
+    }
+    return $files
+}
+
+function Install-TemplateCliPayload
+{
+    param(
+        [Parameter(Mandatory)][string]$PayloadRoot,
+        [Parameter(Mandatory)][string]$InstallRoot,
+        [Parameter(Mandatory)][string]$ExpectedVersion,
+        [Parameter(Mandatory)][string]$BackupRoot
+    )
+
+    $newFiles = @(Get-PayloadManifestFiles -PayloadRoot $PayloadRoot -RequireExactInventory)
+    $oldFiles = @()
+    $installedManifest = Join-Path $InstallRoot 'payload-manifest.json'
+    if (Test-Path -LiteralPath $installedManifest -PathType Leaf)
+    {
+        $oldManifest = Get-Content -LiteralPath $installedManifest -Raw | ConvertFrom-Json
+        foreach ($file in @($oldManifest.files))
+        {
+            if ([string]::IsNullOrWhiteSpace($file) -or [System.IO.Path]::IsPathRooted($file) -or $file.Contains('\') -or $file -match '(^|/)\.\.(/|$)')
+            {
+                throw "Installed payload manifest contains unsafe path '$file'."
+            }
+            $oldFiles += $file
+        }
+    }
+    elseif (Test-Path -LiteralPath (Join-Path $InstallRoot 'templatecli.exe'))
+    {
+        $oldFiles = @('templatecli.exe')
+    }
+    $managedFiles = @($newFiles + $oldFiles + 'payload-manifest.json' | Sort-Object -Unique)
+    New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    foreach ($file in $managedFiles)
+    {
+        $installedPath = Join-Path $InstallRoot $file.Replace('/', '\')
+        if (Test-Path -LiteralPath $installedPath -PathType Leaf)
+        {
+            $backupPath = Join-Path $BackupRoot $file.Replace('/', '\')
+            New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($backupPath)) -Force | Out-Null
+            Copy-Item -LiteralPath $installedPath -Destination $backupPath -Force
+        }
+    }
+    try
+    {
+        foreach ($file in $managedFiles) { Remove-Item -LiteralPath (Join-Path $InstallRoot $file.Replace('/', '\')) -Force -ErrorAction SilentlyContinue }
+        foreach ($file in $newFiles)
+        {
+            $source = Join-Path $PayloadRoot $file.Replace('/', '\')
+            $destination = Join-Path $InstallRoot $file.Replace('/', '\')
+            New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+        }
+        Copy-Item -LiteralPath (Join-Path $PayloadRoot 'payload-manifest.json') -Destination $installedManifest -Force
+        $actualVersion = Get-TemplateCliVersionString -BinaryPath (Join-Path $InstallRoot 'templatecli.exe')
+        if ($actualVersion -ne $ExpectedVersion) { throw "Installed version '$actualVersion' did not match '$ExpectedVersion'." }
+    }
+    catch
+    {
+        foreach ($file in $managedFiles) { Remove-Item -LiteralPath (Join-Path $InstallRoot $file.Replace('/', '\')) -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $BackupRoot)
+        {
+            Get-ChildItem -LiteralPath $BackupRoot -File -Recurse | ForEach-Object {
+                $relative = $_.FullName.Substring(([System.IO.Path]::GetFullPath($BackupRoot).TrimEnd('\') + '\').Length)
+                $destination = Join-Path $InstallRoot $relative
+                New-Item -ItemType Directory -Path ([System.IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+                Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+            }
+        }
+        throw
+    }
 }
 
 function Invoke-StatusStep
@@ -1169,15 +1339,6 @@ function Invoke-TemplateCliInstall
         throw "Release '$($release.name)' does not contain expected asset '$assetName'."
     }
 
-    if ($Quality -eq 'Dev' -and -not $Force)
-    {
-        $confirmation = Read-Host "Dev quality disables checksum/signature verification. Type YES to continue"
-        if ($confirmation -cne 'YES')
-        {
-            throw 'Installation canceled by user.'
-        }
-    }
-
     $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("templatecli-install-" + [guid]::NewGuid().ToString('N'))
     $downloadPath = Join-Path $tempRoot $assetName
     $extractPath = Join-Path $tempRoot 'extract'
@@ -1193,30 +1354,29 @@ function Invoke-TemplateCliInstall
             Invoke-GitHubAssetDownload -AssetUrl $asset.browser_download_url -AssetName $assetName -DestinationDirectory $tempRoot
         }
 
-        if ($Quality -ne 'Dev')
+        $checksumsAsset = Get-ReleaseAsset -Release $release -AssetName 'checksums.txt'
+        $releaseMetadataAsset = Get-ReleaseAsset -Release $release -AssetName 'release-metadata.json'
+        if ($null -eq $checksumsAsset -or $null -eq $releaseMetadataAsset)
         {
-            $checksumsAsset = Get-ReleaseAsset -Release $release -AssetName 'checksums.txt'
-            if ($null -eq $checksumsAsset)
-            {
-                throw "Release '$($release.name)' did not include checksums.txt."
-            }
-
-            $checksumsPath = Join-Path $tempRoot 'checksums.txt'
-            Write-Verbose "Downloading checksums from release '$($release.tag_name)' to '$checksumsPath'."
-            Invoke-GitHubAssetDownload -AssetUrl $checksumsAsset.browser_download_url -AssetName 'checksums.txt' -DestinationDirectory $tempRoot
-
-            $releaseMetadataPath = $null
-            $releaseMetadataAsset = Get-ReleaseAsset -Release $release -AssetName 'release-metadata.json'
-            if ($null -ne $releaseMetadataAsset)
-            {
-                $releaseMetadataPath = Join-Path $tempRoot 'release-metadata.json'
-                Write-Verbose "Downloading release metadata from release '$($release.tag_name)' to '$releaseMetadataPath'."
-                Invoke-GitHubAssetDownload -AssetUrl $releaseMetadataAsset.browser_download_url -AssetName 'release-metadata.json' -DestinationDirectory $tempRoot
-            }
-
-            Invoke-StatusStep -Message 'Verifying asset checksums' -Action {
-                $null = Assert-WindowsArchiveIntegrity -ArchivePath $downloadPath -AssetName $assetName -ChecksumsPath $checksumsPath -ReleaseMetadataPath $releaseMetadataPath
-            }
+            throw "Release '$($release.name)' must include checksums.txt and release-metadata.json."
+        }
+        $checksumsPath = Join-Path $tempRoot 'checksums.txt'
+        $releaseMetadataPath = Join-Path $tempRoot 'release-metadata.json'
+        Invoke-GitHubAssetDownload -AssetUrl $checksumsAsset.browser_download_url -AssetName 'checksums.txt' -DestinationDirectory $tempRoot
+        Invoke-GitHubAssetDownload -AssetUrl $releaseMetadataAsset.browser_download_url -AssetName 'release-metadata.json' -DestinationDirectory $tempRoot
+        $releaseMetadata = Get-Content -LiteralPath $releaseMetadataPath -Raw | ConvertFrom-Json
+        $expectedVersion = $release.tag_name -replace '^v', ''
+        if ($releaseMetadata.version -ne $expectedVersion -or $releaseMetadata.sourceCommit -notmatch '^[0-9a-fA-F]{40}$')
+        {
+            throw "release-metadata.json does not bind version and source commit to '$($release.tag_name)'."
+        }
+        $assetNames = @($releaseMetadata.assets | ForEach-Object { $_.name })
+        if (@($assetNames | Select-Object -Unique).Count -ne $assetNames.Count)
+        {
+            throw 'release-metadata.json contains duplicate asset names.'
+        }
+        Invoke-StatusStep -Message 'Verifying asset checksums' -Action {
+            $null = Assert-WindowsArchiveIntegrity -ArchivePath $downloadPath -AssetName $assetName -ChecksumsPath $checksumsPath -ReleaseMetadataPath $releaseMetadataPath
         }
 
         $downloadedBinaryPath = Expand-WindowsReleaseArchive -ArchivePath $downloadPath -DestinationPath $extractPath
@@ -1224,12 +1384,16 @@ function Invoke-TemplateCliInstall
         if ($Quality -ne 'Dev')
         {
             Invoke-StatusStep -Message 'Verifying asset provenance' -Action {
-                $null = Assert-WindowsBinaryTrust -BinaryPath $downloadedBinaryPath -ExpectedSubject $ExpectedSignerSubject -ExpectedIssuerSha512Thumbprints $ExpectedSignerIssuerSha512Thumbprints -ExpectedParentIssuerSha512Thumbprints $ExpectedSignerParentIssuerSha512Thumbprints
+                Get-ChildItem -LiteralPath $extractPath -File -Recurse |
+                    Where-Object { $_.Extension -in @('.exe', '.dll') } |
+                    ForEach-Object {
+                        $null = Assert-WindowsBinaryTrust -BinaryPath $_.FullName -ExpectedSubject $ExpectedSignerSubject -ExpectedIssuerSha512Thumbprints $ExpectedSignerIssuerSha512Thumbprints -ExpectedParentIssuerSha512Thumbprints $ExpectedSignerParentIssuerSha512Thumbprints
+                    }
             }
         }
         else
         {
-            Write-Host 'Skipping checksum and provenance verification for development build.'
+            Write-Host 'Skipping signature verification for development build; checksums remain enforced.'
         }
 
         $installDirectory = [System.IO.Path]::GetFullPath($TargetPath)
@@ -1258,7 +1422,7 @@ function Invoke-TemplateCliInstall
         if ($shouldInstall)
         {
             Invoke-StatusStep -Message "Installing $downloadedVersion to '$installDirectory'" -Action {
-                Copy-Item -Path $downloadedBinaryPath -Destination $destinationPath -Force
+                Install-TemplateCliPayload -PayloadRoot $extractPath -InstallRoot $installDirectory -ExpectedVersion $downloadedVersion -BackupRoot (Join-Path $tempRoot 'backup')
             }
         }
 

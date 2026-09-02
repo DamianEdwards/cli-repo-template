@@ -38,6 +38,9 @@ jobs:
           validate-native-aot: 'true'
           aot-runtime-identifier: linux-x64
 
+      - name: Test
+        run: dotnet test cli-repo-template.slnx --configuration Release --no-build --nologo --tl:off
+
   publish-aot:
     needs: [build]
     strategy:

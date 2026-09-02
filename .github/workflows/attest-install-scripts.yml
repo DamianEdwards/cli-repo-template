@@ -1,4 +1,4 @@
-name: Attest Install Scripts
+name: Finalize Install Script Release
 
 on:
   workflow_dispatch:
@@ -6,39 +6,72 @@ on:
 concurrency:
   group: attest-install-scripts-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   attest-and-release:
-    runs-on: ubuntu-latest
-
+    runs-on: windows-2022
+    environment: production
     permissions:
+      attestations: write
       contents: write
       id-token: write
-      attestations: write
-
     steps:
-      - name: Checkout tag
+      - name: Checkout immutable snapshot tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
-      - name: Verify published install script files
+      - name: Verify snapshot identity and contents
         shell: bash
         run: |
           set -euo pipefail
+          test '${{ github.ref_type }}' = tag
+          [[ '${{ github.ref_name }}' == install-scripts-v* ]]
+          test "$(git cat-file -t 'refs/tags/${{ github.ref_name }}')" = tag ||
+            { echo "::error::Install script snapshot tag must be annotated."; exit 1; }
           test -f ./install.ps1
           test -f ./install.sh
           test -f ./install-scripts.json
           test -f ./checksums.txt
-          sha256sum --check ./checksums.txt
+          test "$(jq -r '.version' ./install-scripts.json)" = '${{ github.ref_name }}'
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check ./checksums.txt
+          else
+            shasum -a 256 --check ./checksums.txt
+          fi
+          git fetch origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/heads/install-scripts:refs/remotes/origin/install-scripts
+          TAG_SHA=$(git rev-list -n 1 '${{ github.ref_name }}')
+          git merge-base --is-ancestor "$TAG_SHA" refs/remotes/origin/install-scripts ||
+            { echo "::error::Snapshot tag is not from the install-scripts branch."; exit 1; }
+          SOURCE_SHA=$(jq -r '.sourceCommit' ./install-scripts.json)
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::Install script sourceCommit is invalid."; exit 1; }
+          git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main ||
+            { echo "::error::Install scripts were not published from main."; exit 1; }
+
+      - name: Verify install.ps1 Authenticode signature
+        shell: pwsh
+        run: |
+          $signature = Get-AuthenticodeSignature -FilePath './install.ps1'
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "install.ps1 Authenticode signature is not valid: $($signature.StatusMessage)"
+          }
 
       - name: Attest published install scripts
+        id: attest
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
           subject-path: |
-            ./install.sh
             ./install.ps1
+            ./install.sh
+
+      - name: Stage portable attestation bundle
+        shell: bash
+        run: cp '${{ steps.attest.outputs.bundle-path }}' ./attestations.jsonl
 
       - name: Publish immutable install script snapshot
         env:
@@ -47,17 +80,20 @@ jobs:
         run: |
           set -euo pipefail
           TAG='${{ github.ref_name }}'
-
-          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            gh release delete "$TAG" --repo "${{ github.repository }}" --yes
+          if gh api "repos/${{ github.repository }}/releases/tags/${TAG}" >/dev/null 2>"$RUNNER_TEMP/release-query.err"; then
+            echo "::error::Snapshot release ${TAG} already exists; refusing to delete or recreate it."
+            exit 1
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-query.err"; then
+            cat "$RUNNER_TEMP/release-query.err" >&2
+            exit 1
           fi
-
           gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo '${{ github.repository }}' \
             --latest=false \
             --title "$TAG" \
-            --notes "Immutable install script snapshot published from the install-scripts branch." \
+            --notes "Immutable signed install-script snapshot published from the install-scripts branch." \
             ./install.ps1 \
             ./install.sh \
             ./install-scripts.json \
-            ./checksums.txt
+            ./checksums.txt \
+            ./attestations.jsonl

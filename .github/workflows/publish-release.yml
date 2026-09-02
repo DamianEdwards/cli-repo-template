@@ -1,26 +1,25 @@
-name: Publish Release
+name: Start App Release
 
 on:
   workflow_dispatch:
     inputs:
       ci_run_id:
-        description: "Optional CI run ID to promote. Defaults to the latest successful CI run on main."
+        description: Optional CI run ID to promote. Defaults to the latest successful CI run on main.
         required: false
         default: ''
       default_post_release_phase:
-        description: "Phase for the next version after a successful release (pre, rc, rtm). Defaults to repo variable DEFAULT_POST_RELEASE_PHASE or 'pre'."
+        description: Phase after a successful stable release.
         required: false
         default: ''
         type: choice
-        options:
-          - ''
-          - pre
-          - rc
-          - rtm
+        options: ['', pre, rc, rtm]
 
 concurrency:
+  # The finalizer owns release-state serialization. Sharing that group here
+  # could strand the dispatched child behind this workflow.
   group: publish-release
   cancel-in-progress: false
+  queue: max
 
 env:
   DOTNET_NOLOGO: true
@@ -28,13 +27,16 @@ env:
   DOTNET_CLI_TELEMETRY_OPTOUT: true
 
 jobs:
-  publish-tag:
+  validate-promotion:
     runs-on: ubuntu-latest
-
     permissions:
-      contents: write
       actions: read
-
+      contents: read
+    outputs:
+      version: ${{ steps.context.outputs.version }}
+      ci_run_id: ${{ steps.context.outputs.ci_run_id }}
+      ci_head_sha: ${{ steps.context.outputs.ci_head_sha }}
+      default_phase: ${{ steps.context.outputs.default_phase }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -46,72 +48,164 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Resolve release version and CI run
+      - name: Resolve release version and validate CI run
+        id: context
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          test '${{ github.ref }}' = 'refs/heads/main' ||
+            { echo "::error::Start App Release must be dispatched from main."; exit 1; }
 
-          git fetch origin release-state >/dev/null 2>&1 || true
-
-          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
-            STATE_JSON=$(git show origin/release-state:version-state.json)
+          RELEASE_STATE_REF=$(git ls-remote --heads origin refs/heads/release-state)
+          if [ -n "$RELEASE_STATE_REF" ]; then
+            git fetch origin refs/heads/release-state:refs/remotes/origin/release-state
+            STATE_JSON=$(git show refs/remotes/origin/release-state:version-state.json)
           else
-            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            RELEASES_JSON=$(gh release list --repo '${{ github.repository }}' --json tagName,isDraft,isPrerelease --limit 1000)
             STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
           fi
+          VERSION=$(dotnet scripts/version.cs calculate --state "$STATE_JSON" | jq -r '.rcVersion')
 
-          VERSIONS_JSON=$(dotnet scripts/version.cs calculate --state "$STATE_JSON")
-          VERSION=$(echo "$VERSIONS_JSON" | jq -r '.rcVersion')
-
-          CI_RUN_ID='${{ github.event.inputs.ci_run_id }}'
+          CI_RUN_ID='${{ inputs.ci_run_id }}'
           if [ -z "$CI_RUN_ID" ]; then
-            CI_RUN_ID=$(gh run list --repo "${{ github.repository }}" --workflow=ci.yml --branch=main --status=success --limit=1 --json databaseId --jq '.[0].databaseId // empty')
+            CI_RUN_ID=$(gh run list --repo '${{ github.repository }}' --workflow=ci.yml --branch=main --status=success --limit=1 --json databaseId --jq '.[0].databaseId // empty')
           fi
+          [[ "$CI_RUN_ID" =~ ^[0-9]+$ ]] ||
+            { echo "::error::A valid successful CI run ID is required."; exit 1; }
 
-          if [ -z "$CI_RUN_ID" ]; then
-            echo "::error::No successful CI run found to promote."
-            exit 1
-          fi
+          RUN_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${CI_RUN_ID}")
+          test "$(jq -r '.name' <<< "$RUN_JSON")" = CI ||
+            { echo "::error::Run ${CI_RUN_ID} is not the CI workflow."; exit 1; }
+          test "$(jq -r '.path' <<< "$RUN_JSON")" = '.github/workflows/ci.yml' ||
+            { echo "::error::Run ${CI_RUN_ID} did not execute .github/workflows/ci.yml."; exit 1; }
+          test "$(jq -r '.status' <<< "$RUN_JSON")" = completed ||
+            { echo "::error::Run ${CI_RUN_ID} is not complete."; exit 1; }
+          test "$(jq -r '.conclusion' <<< "$RUN_JSON")" = success ||
+            { echo "::error::Run ${CI_RUN_ID} did not succeed."; exit 1; }
+          RUN_EVENT=$(jq -r '.event' <<< "$RUN_JSON")
+          [[ "$RUN_EVENT" == push || "$RUN_EVENT" == workflow_dispatch ]] ||
+            { echo "::error::Run ${CI_RUN_ID} was not triggered by a main push or manual dispatch."; exit 1; }
+          test "$(jq -r '.head_branch' <<< "$RUN_JSON")" = main ||
+            { echo "::error::Run ${CI_RUN_ID} is not from main."; exit 1; }
+          test "$(jq -r '.head_repository.full_name' <<< "$RUN_JSON")" = '${{ github.repository }}' ||
+            { echo "::error::Run ${CI_RUN_ID} is from a different repository."; exit 1; }
+          CI_HEAD_SHA=$(jq -r '.head_sha' <<< "$RUN_JSON")
+          [[ "$CI_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+            { echo "::error::Run ${CI_RUN_ID} has an invalid head SHA."; exit 1; }
 
-          CI_HEAD_SHA=$(gh run view "$CI_RUN_ID" --repo "${{ github.repository }}" --json headSha --jq '.headSha // empty')
-          if [ -z "$CI_HEAD_SHA" ]; then
-            echo "::error::Could not determine the commit SHA for CI run ${CI_RUN_ID}."
-            exit 1
-          fi
-
-          DEFAULT_PHASE='${{ github.event.inputs.default_post_release_phase }}'
-          if [ -z "$DEFAULT_PHASE" ]; then
-            DEFAULT_PHASE='${{ vars.DEFAULT_POST_RELEASE_PHASE }}'
-          fi
-          if [ -z "$DEFAULT_PHASE" ]; then
-            DEFAULT_PHASE='pre'
-          fi
-
-          if [[ ! "$DEFAULT_PHASE" =~ ^(pre|rc|rtm)$ ]]; then
-            echo "::error::Invalid post-release phase '${DEFAULT_PHASE}'. Must be pre, rc, or rtm."
-            exit 1
-          fi
+          DEFAULT_PHASE='${{ inputs.default_post_release_phase }}'
+          if [ -z "$DEFAULT_PHASE" ]; then DEFAULT_PHASE='${{ vars.DEFAULT_POST_RELEASE_PHASE }}'; fi
+          if [ -z "$DEFAULT_PHASE" ]; then DEFAULT_PHASE=pre; fi
+          [[ "$DEFAULT_PHASE" =~ ^(pre|rc|rtm)$ ]] ||
+            { echo "::error::Invalid post-release phase '${DEFAULT_PHASE}'."; exit 1; }
 
           TAG="v${VERSION}"
-          if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::error::Tag ${TAG} already exists."
+          TAG_EXISTS=false
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null
+          TAG_STATUS=$?
+          set -e
+          if [ "$TAG_STATUS" -eq 0 ]; then TAG_EXISTS=true
+          elif [ "$TAG_STATUS" -ne 2 ]; then echo "::error::Failed to query remote tags."; exit 1
+          fi
+          RELEASE_EXISTS=false
+          if gh api "repos/${{ github.repository }}/releases/tags/${TAG}" >/dev/null 2>"$RUNNER_TEMP/release-query.err"; then
+            RELEASE_EXISTS=true
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-query.err"; then
+            cat "$RUNNER_TEMP/release-query.err" >&2
+            exit 1
+          fi
+          if [ "$TAG_EXISTS" = true ] || [ "$RELEASE_EXISTS" = true ]; then
+            echo "::error::Tag or release ${TAG} already exists."
             exit 1
           fi
 
+          mkdir -p ./artifacts/promotable
+          gh run download "$CI_RUN_ID" --repo '${{ github.repository }}' --name native-promotable-bundle --dir ./artifacts/promotable
+          METADATA=./artifacts/promotable/release-metadata.json
+          test -f "$METADATA" || { echo "::error::CI bundle is missing release-metadata.json."; exit 1; }
+          test "$(jq -r '.version' "$METADATA")" = "$VERSION" ||
+            { echo "::error::CI bundle version does not match ${VERSION}."; exit 1; }
+          test "$(jq -r '.sourceCommit' "$METADATA")" = "$CI_HEAD_SHA" ||
+            { echo "::error::CI bundle source commit does not match ${CI_HEAD_SHA}."; exit 1; }
+          test "$(jq '[.assets[].runtimeIdentifier] | length > 0 and length == (unique | length)' "$METADATA")" = true ||
+            { echo "::error::CI bundle runtime inventory is empty or duplicated."; exit 1; }
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd ./artifacts/promotable && sha256sum --check checksums.txt)
+          else
+            (cd ./artifacts/promotable && shasum -a 256 --check checksums.txt)
+          fi
+          METADATA_ASSETS=$(jq -r '.assets[].name' "$METADATA" | sort)
+          CHECKSUM_ASSETS=$(awk '{print $2}' ./artifacts/promotable/checksums.txt | sed 's/^\*//' | sort)
+          test "$METADATA_ASSETS" = "$CHECKSUM_ASSETS" ||
+            { echo "::error::CI bundle metadata and checksum inventories differ."; exit 1; }
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ci_run_id=${CI_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "ci_head_sha=${CI_HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "default_phase=${DEFAULT_PHASE}" >> "$GITHUB_OUTPUT"
+
+  publish-tag:
+    runs-on: ubuntu-latest
+    needs: [validate-promotion]
+    environment: production
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Publish approved release tag and dispatch finalizer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.validate-promotion.outputs.version }}'
+          CI_RUN_ID='${{ needs.validate-promotion.outputs.ci_run_id }}'
+          CI_HEAD_SHA='${{ needs.validate-promotion.outputs.ci_head_sha }}'
+          DEFAULT_PHASE='${{ needs.validate-promotion.outputs.default_phase }}'
+          TAG="v${VERSION}"
+
+          TAG_EXISTS=false
+          set +e
+          git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null
+          TAG_STATUS=$?
+          set -e
+          if [ "$TAG_STATUS" -eq 0 ]; then TAG_EXISTS=true
+          elif [ "$TAG_STATUS" -ne 2 ]; then echo "::error::Failed to query remote tags."; exit 1
+          fi
+          RELEASE_EXISTS=false
+          if gh api "repos/${{ github.repository }}/releases/tags/${TAG}" >/dev/null 2>"$RUNNER_TEMP/release-query.err"; then
+            RELEASE_EXISTS=true
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-query.err"; then
+            cat "$RUNNER_TEMP/release-query.err" >&2
+            exit 1
+          fi
+          if [ "$TAG_EXISTS" = true ] || [ "$RELEASE_EXISTS" = true ]; then
+            echo "::error::Tag or release ${TAG} already exists."
+            exit 1
+          fi
+
+          git config user.name "${GIT_AUTHOR_NAME:-github-actions[bot]}"
+          git config user.email "${GIT_AUTHOR_EMAIL:-41898282+github-actions[bot]@users.noreply.github.com}"
           git tag -a "$TAG" "$CI_HEAD_SHA" -m "Promote CI run ${CI_RUN_ID} to ${TAG}"
           git push origin "$TAG"
 
+          # If dispatch fails, rerun Finalize App Release manually on this exact
+          # immutable tag and CI run; never recreate or move the tag.
           gh workflow run release.yml \
-            --repo "${{ github.repository }}" \
+            --repo '${{ github.repository }}' \
             --ref "$TAG" \
-            -f ci_run_id="${CI_RUN_ID}" \
-            -f default_post_release_phase="${DEFAULT_PHASE}"
+            -f ci_run_id="$CI_RUN_ID" \
+            -f default_post_release_phase="$DEFAULT_PHASE"
 
-          echo "## Release Tag Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "## App Release Started" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Tag:** \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Version:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **CI Run:** \`${CI_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **CI run:** \`${CI_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Commit:** \`${CI_HEAD_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Release workflow:** queued on ref \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"

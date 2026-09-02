@@ -25,15 +25,15 @@ runs:
 
     - name: Restore
       shell: bash
-      run: dotnet restore ./src/templatecli/templatecli.csproj --nologo --tl:off
+      run: dotnet restore ./cli-repo-template.slnx --nologo --tl:off
 
     - name: Build
       shell: bash
       run: |
         if [ -n "${{ inputs.version }}" ]; then
-          dotnet build ./src/templatecli/templatecli.csproj --configuration Release --no-restore --nologo --tl:off -p:Version=${{ inputs.version }} -p:ContinuousIntegrationBuild=true
+          dotnet build ./cli-repo-template.slnx --configuration Release --no-restore --nologo --tl:off -p:Version=${{ inputs.version }} -p:ContinuousIntegrationBuild=true
         else
-          dotnet build ./src/templatecli/templatecli.csproj --configuration Release --no-restore --nologo --tl:off -p:ContinuousIntegrationBuild=true
+          dotnet build ./cli-repo-template.slnx --configuration Release --no-restore --nologo --tl:off -p:ContinuousIntegrationBuild=true
         fi
 
     - name: Validate NativeAOT publish

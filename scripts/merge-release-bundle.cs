@@ -22,16 +22,25 @@ var releaseVersionOption = new Option<string>("--release-version")
     Description = "Expected asset version.",
     Required = true
 };
+var sourceCommitOption = new Option<string>("--source-commit")
+{
+    Description = "Expected source commit for every asset.",
+    Required = true
+};
 
 var command = new RootCommand("Merge per-asset metadata into a release bundle.");
 command.Options.Add(inputDirectoryOption);
 command.Options.Add(outputDirectoryOption);
 command.Options.Add(releaseVersionOption);
+command.Options.Add(sourceCommitOption);
 command.SetAction(parseResult => ExecuteHandled(() =>
 {
     var inputDirectory = Path.GetFullPath(parseResult.GetValue(inputDirectoryOption)!);
     var outputDirectory = Path.GetFullPath(parseResult.GetValue(outputDirectoryOption)!);
     var releaseVersion = parseResult.GetValue(releaseVersionOption)!;
+    var expectedSourceCommit = parseResult.GetValue(sourceCommitOption)!;
+    if (expectedSourceCommit.Length != 40 || !expectedSourceCommit.All(Uri.IsHexDigit))
+        throw new InvalidOperationException("Source commit must be a 40-character hexadecimal commit ID.");
 
     EnsureDirectoryExists(inputDirectory, "Input directory");
     Directory.CreateDirectory(outputDirectory);
@@ -52,6 +61,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
         .ToArray();
 
     var assets = new List<ReleaseAsset>();
+    string? sourceCommit = null;
     foreach (var metadataFile in metadataFiles)
     {
         var metadata = JsonSerializer.Deserialize(
@@ -64,6 +74,16 @@ command.SetAction(parseResult => ExecuteHandled(() =>
             throw new InvalidOperationException(
                 $"Metadata file '{metadataFile}' reported version '{metadata.Version}' instead of '{releaseVersion}'.");
         }
+
+        if (!string.Equals(metadata.SourceCommit, expectedSourceCommit, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Metadata file '{metadataFile}' reported source commit '{metadata.SourceCommit}' instead of '{expectedSourceCommit}'.");
+        }
+
+        sourceCommit ??= metadata.SourceCommit;
+        if (!string.Equals(sourceCommit, metadata.SourceCommit, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("Per-asset metadata contains inconsistent source commits.");
 
         var assetPath = allFiles.FirstOrDefault(path =>
             string.Equals(Path.GetFileName(path), metadata.AssetName, StringComparison.Ordinal));
@@ -89,6 +109,8 @@ command.SetAction(parseResult => ExecuteHandled(() =>
     var sortedAssets = assets
         .OrderBy(asset => asset.Name, StringComparer.Ordinal)
         .ToArray();
+    if (sortedAssets.Select(asset => asset.RuntimeIdentifier).Distinct(StringComparer.Ordinal).Count() != sortedAssets.Length)
+        throw new InvalidOperationException("Release bundle contains duplicate runtime identifiers.");
 
     File.WriteAllLines(
         Path.Combine(outputDirectory, "checksums.txt"),
@@ -96,6 +118,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
 
     var releaseMetadata = new ReleaseMetadata(
         releaseVersion,
+        sourceCommit ?? throw new InvalidOperationException("Release bundle source commit is missing."),
         sortedAssets,
         sortedAssets.Where(asset => string.Equals(asset.Platform, "win", StringComparison.Ordinal)).ToArray());
 
@@ -160,7 +183,8 @@ internal sealed record AssetMetadata(
     string AssetName,
     string FileType,
     string CommandName,
-    string Sha256);
+    string Sha256,
+    string? SourceCommit);
 
 internal sealed record ReleaseAsset(
     string Name,
@@ -173,6 +197,7 @@ internal sealed record ReleaseAsset(
 
 internal sealed record ReleaseMetadata(
     string Version,
+    string SourceCommit,
     IReadOnlyList<ReleaseAsset> Assets,
     IReadOnlyList<ReleaseAsset> WindowsAssets);
 

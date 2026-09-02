@@ -1,7 +1,4 @@
 using System.Diagnostics;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
@@ -24,35 +21,39 @@ public sealed class ProvenanceVerifier
     private static readonly TimeSpan VerifyTimeout = TimeSpan.FromSeconds(60);
     private const string GitHubActionsOidcIssuer = "https://token.actions.githubusercontent.com";
     private const string TrustedReleaseWorkflowFile = "release.yml";
-    private static readonly HttpClient GitHubApiClient = CreateGitHubApiClient();
 
     public ProvenanceVerifier(ILogger<ProvenanceVerifier> logger)
     {
         _logger = logger;
     }
 
-    /// <summary>
-    /// Verifies provenance of a binary file.
-    /// On Windows: Authenticode signature and certificate chain via embedded PowerShell script.
-    /// On Linux/macOS: GitHub artifact attestation bundle verification via Sigstore.
-    /// </summary>
-    /// <returns>True if verification passed, false if it failed.</returns>
-    public async Task<(bool Success, string? Error)> VerifyBinaryTrustAsync(string binaryPath, string? sourceRef, CancellationToken ct)
+    public async Task<(bool Success, string? Error)> VerifyWindowsPayloadAsync(
+        string payloadDirectory,
+        CancellationToken ct)
     {
-        if (OperatingSystem.IsWindows())
-            return await VerifyAuthenticodeAsync(binaryPath, ct);
+        foreach (var fileName in GetWindowsExecutablePayloadFileNames(
+                     Services.PayloadInstaller.ValidateManifest(payloadDirectory)))
+        {
+            var result = await VerifyAuthenticodeAsync(Path.Combine(payloadDirectory, fileName), ct);
+            if (!result.Success)
+                return result;
+        }
 
-        return await VerifyAttestationAsync(binaryPath, sourceRef, ct);
+        return (true, null);
     }
 
-    /// <summary>
-    /// Verifies GitHub artifact attestation for a file using the GitHub attestation bundle API
-    /// and local Sigstore verification.
-    /// Used on Linux/macOS where Authenticode is not available.
-    /// Mirrors the verification done by the template install script.
-    /// Tries each allowed workflow identity that may have produced the release asset.
-    /// </summary>
-    public async Task<(bool Success, string? Error)> VerifyAttestationAsync(string filePath, string? sourceRef, CancellationToken ct)
+    public static IReadOnlyList<string> GetWindowsExecutablePayloadFileNames(
+        IEnumerable<string> payloadFiles)
+        => payloadFiles
+            .Where(AppIdentity.IsWindowsExecutablePayloadFile)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    public async Task<(bool Success, string? Error)> VerifyArchiveAttestationAsync(
+        string filePath,
+        string sourceRef,
+        string bundlePath,
+        CancellationToken ct)
     {
         _logger.LogInformation("Verifying artifact attestation for '{FilePath}'", filePath);
 
@@ -78,112 +79,51 @@ public sealed class ProvenanceVerifier
             return (false, message);
         }
 
-        var digest = await ComputeSha256Async(filePath, ct);
-        if (digest is null)
-            return (false, $"Failed to compute SHA256 for '{filePath}'.");
+        if (!File.Exists(bundlePath))
+            return (false, "The release does not contain its portable Sigstore attestation bundle.");
 
-        var (bundleJson, bundleError) = await DownloadAttestationBundleAsync(owner, repository, digest, ct);
-        if (bundleJson is null)
-        {
-            _logger.LogWarning("Failed to download attestation bundle for '{FilePath}': {Error}", filePath, bundleError);
-            return (false, bundleError ?? "Failed to download attestation bundle.");
-        }
-
-        SigstoreBundle bundle;
+        string[] bundleLines;
         try
         {
-            bundle = SigstoreBundle.Deserialize(bundleJson);
-        }
-        catch (JsonException ex)
-        {
-            var message = $"GitHub returned an invalid Sigstore bundle: {ex.Message}";
-            _logger.LogWarning(ex, "{Message}", message);
-            return (false, message);
-        }
-
-        var policy = CreateGitHubActionsPolicy(owner, repository, TrustedReleaseWorkflowFile, sourceRef);
-        await using var artifactStream = File.OpenRead(filePath);
-        var (success, result) = await _sigstoreVerifier.TryVerifyStreamAsync(artifactStream, bundle, policy);
-        if (success)
-        {
-            _logger.LogInformation("Artifact attestation verification passed for '{FilePath}' using workflow '{WorkflowFile}' at '{SourceRef}'", filePath, TrustedReleaseWorkflowFile, sourceRef);
-            return (true, null);
-        }
-
-        var lastError = result?.FailureReason;
-        _logger.LogWarning("Attestation verification failed for '{FilePath}': {Error}", filePath, lastError);
-        return (false, lastError ?? "Attestation verification failed");
-    }
-
-    private async Task<string?> ComputeSha256Async(string filePath, CancellationToken ct)
-    {
-        try
-        {
-            await using var stream = File.OpenRead(filePath);
-            var hashBytes = await SHA256.HashDataAsync(stream, ct);
-            return Convert.ToHexStringLower(hashBytes);
+            bundleLines = await File.ReadAllLinesAsync(bundlePath, ct);
         }
         catch (IOException ex)
         {
-            _logger.LogWarning(ex, "Failed to compute SHA256 for '{FilePath}'", filePath);
-            return null;
-        }
-    }
-
-    private async Task<(string? BundleJson, string? Error)> DownloadAttestationBundleAsync(
-        string owner,
-        string repository,
-        string digest,
-        CancellationToken ct)
-    {
-        var endpoint = $"https://api.github.com/repos/{owner}/{repository}/dependency-graph/artifact-attestations/sha256/{digest}/bundle";
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(VerifyTimeout);
-
-        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
-        request.Headers.UserAgent.Add(new ProductInfoHeaderValue(AppIdentity.CommandName, typeof(ProvenanceVerifier).Assembly.GetName().Version?.ToString() ?? "0.0.0"));
-
-        var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN")
-            ?? Environment.GetEnvironmentVariable("GH_TOKEN");
-        if (!string.IsNullOrWhiteSpace(token))
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-
-        HttpResponseMessage response;
-        try
-        {
-            response = await GitHubApiClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
-        }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        {
-            return (null, $"Timed out downloading attestation bundle for sha256:{digest}.");
-        }
-        catch (HttpRequestException ex)
-        {
-            return (null, $"Failed to download attestation bundle: {ex.Message}");
+            return (false, $"The release Sigstore attestation bundle could not be read: {ex.Message}");
         }
 
-        using (response)
+        var policy = CreateGitHubActionsPolicy(owner, repository, TrustedReleaseWorkflowFile, sourceRef);
+        var failures = new List<string>();
+        foreach (var bundleJson in bundleLines.Where(line => !string.IsNullOrWhiteSpace(line)))
         {
-            if (response.StatusCode == HttpStatusCode.NotFound)
+            try
             {
-                return (null, $"No GitHub attestation bundle was found for sha256:{digest} in {owner}/{repository}.");
-            }
+                var bundle = SigstoreBundle.Deserialize(bundleJson);
+                await using var artifactStream = File.OpenRead(filePath);
+                var (success, result) =
+                    await _sigstoreVerifier.TryVerifyStreamAsync(artifactStream, bundle, policy);
+                if (success)
+                {
+                    _logger.LogInformation(
+                        "Artifact attestation verification passed for '{FilePath}' using workflow '{WorkflowFile}' at '{SourceRef}'",
+                        filePath,
+                        TrustedReleaseWorkflowFile,
+                        sourceRef);
+                    return (true, null);
+                }
 
-            if (response.StatusCode == HttpStatusCode.Forbidden || response.StatusCode == HttpStatusCode.Unauthorized)
+                if (!string.IsNullOrWhiteSpace(result?.FailureReason))
+                    failures.Add(result.FailureReason);
+            }
+            catch (JsonException ex)
             {
-                return (null, $"GitHub denied access to the attestation bundle for sha256:{digest}. Set GITHUB_TOKEN or GH_TOKEN when verifying private repositories or when public API rate limits are exceeded.");
+                failures.Add(ex.Message);
             }
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var errorBody = await response.Content.ReadAsStringAsync(timeoutCts.Token);
-                return (null, $"GitHub attestation bundle request failed with {(int)response.StatusCode} {response.ReasonPhrase}: {errorBody}");
-            }
-
-            return (await response.Content.ReadAsStringAsync(timeoutCts.Token), null);
         }
+
+        var lastError = failures.Count == 0 ? null : failures[^1];
+        _logger.LogWarning("Attestation verification failed for '{FilePath}': {Error}", filePath, lastError);
+        return (false, lastError ?? "Attestation verification failed");
     }
 
     private static VerificationPolicy CreateGitHubActionsPolicy(string owner, string repository, string workflowFile, string sourceRef)
@@ -214,14 +154,6 @@ public sealed class ProvenanceVerifier
         owner = parts[0];
         name = parts[1];
         return true;
-    }
-
-    private static HttpClient CreateGitHubApiClient()
-    {
-        var client = new HttpClient();
-        client.DefaultRequestHeaders.UserAgent.Add(
-            new ProductInfoHeaderValue(AppIdentity.CommandName, typeof(ProvenanceVerifier).Assembly.GetName().Version?.ToString() ?? "0.0.0"));
-        return client;
     }
 
     /// <summary>
@@ -273,6 +205,7 @@ public sealed class ProvenanceVerifier
             {
                 _logger.LogWarning("Provenance verification timed out after {Timeout}s", VerifyTimeout.TotalSeconds);
                 process.Kill();
+                await process.WaitForExitAsync(CancellationToken.None);
                 return (false, "Provenance verification timed out");
             }
 
@@ -357,7 +290,11 @@ public sealed class ProvenanceVerifier
     /// <summary>
     /// Validates that release-metadata.json agrees with checksums.txt for a given asset.
     /// </summary>
-    public (bool Success, string? Error) ValidateReleaseMetadata(string metadataPath, string assetName, string expectedSha256)
+    public (bool Success, string? Error) ValidateReleaseMetadata(
+        string metadataPath,
+        string assetName,
+        string expectedSha256,
+        string expectedVersion)
     {
         _logger.LogDebug("Validating release metadata for '{AssetName}'", assetName);
 
@@ -365,6 +302,15 @@ public sealed class ProvenanceVerifier
         {
             var json = File.ReadAllText(metadataPath);
             using var doc = JsonDocument.Parse(json);
+
+            if (!doc.RootElement.TryGetProperty("version", out var version)
+                || !string.Equals(
+                    version.GetString()?.TrimStart('v'),
+                    expectedVersion.TrimStart('v'),
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return (false, $"release-metadata.json did not identify expected version '{expectedVersion}'");
+            }
 
             if (!doc.RootElement.TryGetProperty("assets", out var assets))
                 return (false, "release-metadata.json does not contain 'assets' array");
@@ -428,7 +374,7 @@ public sealed class ProvenanceVerifier
         return File.Exists(candidatePath) ? candidatePath : "powershell.exe";
     }
 
-    private static string GetWindowsPowerShellModulePath()
+    public static string GetWindowsPowerShellModulePath()
     {
         var modulePaths = new List<string>();
 
@@ -460,7 +406,8 @@ public sealed class ProvenanceVerifier
 
             var parts = line.Split([' ', '*'], StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length >= 2 && parts[^1].Equals(assetName, StringComparison.OrdinalIgnoreCase)
-                && parts[0].Length == 64)
+                && parts[0].Length == 64
+                && parts[0].All(Uri.IsHexDigit))
             {
                 return parts[0].ToLowerInvariant();
             }

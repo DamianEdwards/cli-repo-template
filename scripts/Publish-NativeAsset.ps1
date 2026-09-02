@@ -156,8 +156,39 @@ try
     }
 
     New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
-    Copy-Item $binaryPath (Join-Path $stagingDirectory $binaryName) -Force
+    $excludePatterns = @('*.pdb', '*.xml', '*.deps.json.map', '*.dbg', '*.dwarf')
+    $payloadFiles = Get-ChildItem -Path $publishDirectory -File -Recurse |
+        Where-Object {
+            foreach ($pattern in $excludePatterns)
+            {
+                if ($_.Name -like $pattern) { return $false }
+            }
+            return $true
+        }
+    foreach ($file in $payloadFiles)
+    {
+        $relative = $file.FullName.Substring($publishDirectory.Length).TrimStart('\','/')
+        $destination = Join-Path $stagingDirectory $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item $file.FullName $destination -Force
+    }
     Copy-Item (Join-Path $repoRoot 'LICENSE') (Join-Path $stagingDirectory 'LICENSE') -Force
+
+    $manifestFileName = 'payload-manifest.json'
+    [string[]]$manifestFiles = @(
+        Get-ChildItem -Path $stagingDirectory -File -Recurse |
+            ForEach-Object {
+                [System.IO.Path]::GetRelativePath($stagingDirectory, $_.FullName).Replace('\', '/')
+            }
+    )
+    if ($manifestFiles.Count -eq 0)
+    {
+        throw "Cannot generate '$manifestFileName' for an empty staged payload."
+    }
+    [System.Array]::Sort($manifestFiles, [System.StringComparer]::Ordinal)
+    [ordered]@{ files = $manifestFiles } |
+        ConvertTo-Json -Depth 3 |
+        Set-Content -Path (Join-Path $stagingDirectory $manifestFileName) -Encoding utf8
 
     $assetPath =
         if ($platform -eq 'win')
@@ -203,6 +234,7 @@ try
         fileType = if ($platform -eq 'win') { 'zip' } else { 'tar.gz' }
         commandName = 'templatecli'
         sha256 = $hash
+        sourceCommit = if ([string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { $null } else { $env:GITHUB_SHA }
     }
 
     $metadataPath = Join-Path $artifactsDirectory ("templatecli-$RuntimeIdentifier.json")

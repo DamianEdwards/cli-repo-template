@@ -97,6 +97,11 @@ runs:
       shell: pwsh
       run: ./scripts/Verify-PowerShellSyntax.ps1
 
+    - name: Test installer payload contract
+      if: steps.changes.outputs.should-run == 'true'
+      shell: pwsh
+      run: ./scripts/Test-InstallerPayloadContract.ps1
+
     - name: Validate shell script syntax
       if: steps.changes.outputs.should-run == 'true'
       shell: bash

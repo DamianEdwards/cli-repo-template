@@ -53,8 +53,8 @@ public sealed class UpdateService
 
     public static bool HasUsableStagedUpdate(UpdateState state)
         => (state.Status == UpdateStatus.Staged || state.Status == UpdateStatus.WaitingForExit)
-           && !string.IsNullOrEmpty(state.StagedPath)
-           && File.Exists(state.StagedPath);
+           && ((!string.IsNullOrEmpty(state.StagedDirectory) && Directory.Exists(state.StagedDirectory))
+               || (!string.IsNullOrEmpty(state.StagedPath) && File.Exists(state.StagedPath)));
 
     public bool TryScheduleDeferredInstall(int waitForPid, DateTimeOffset waitForStartTime, int watcherPid, DateTimeOffset? watcherStartTime)
     {
@@ -210,8 +210,9 @@ public sealed class UpdateService
     /// <summary>
     /// Checks whether an update is available from GitHub Releases.
     /// </summary>
-    public UpdateCheckResult? CheckForUpdate(bool allowPreRelease)
+    public UpdateCheckResult? CheckForUpdate(bool allowPreRelease, bool stableOnly = false)
     {
+        ThrowIfDisabled();
         var currentVersionStr = VersionHelper.GetCurrentVersion();
         if (currentVersionStr is null || !VersionHelper.TryParse(currentVersionStr, out var currentVersion))
         {
@@ -219,13 +220,12 @@ public sealed class UpdateService
             return null;
         }
 
-        // Determine quality based on current version
-        var quality = VersionHelper.IsDevBuild(currentVersion) ? "Dev"
-            : VersionHelper.IsStableBuild(currentVersion) && !allowPreRelease ? "Stable"
-            : "PreRelease";
-
         var assetName = GitHubReleaseService.GetPlatformAssetName();
-        var release = _releaseService.GetLatestRelease(quality, assetName);
+        var release = _releaseService.GetLatestRelease(
+            currentVersion,
+            allowPreRelease,
+            stableOnly,
+            assetName);
         if (release is null)
         {
             _logger.LogDebug("No matching release found");
@@ -237,13 +237,6 @@ public sealed class UpdateService
         if (!VersionHelper.TryParse(candidateVersionStr, out var candidateVersion))
         {
             _logger.LogDebug("Could not parse candidate version '{Version}' from release tag", candidateVersionStr);
-            return null;
-        }
-
-        if (!VersionHelper.IsUpdateCandidate(currentVersion, candidateVersion, allowPreRelease))
-        {
-            _logger.LogDebug("Release '{Version}' is not an update candidate for current '{Current}'",
-                candidateVersionStr, currentVersionStr);
             return null;
         }
 
@@ -295,27 +288,44 @@ public sealed class UpdateService
                 return false;
             }
 
-            // Download and validate release-metadata.json if available
-            if (_releaseService.DownloadReleaseAsset(update.ReleaseTag, "release-metadata.json", tempRoot))
+            if (!_releaseService.DownloadReleaseAsset(update.ReleaseTag, "release-metadata.json", tempRoot))
             {
-                var metadataPath = Path.Combine(tempRoot, "release-metadata.json");
-                var expectedHash = GetExpectedHash(checksumsPath, assetName);
-                if (expectedHash is not null)
-                {
-                    var (metaOk, metaErr) = _provenanceVerifier.ValidateReleaseMetadata(metadataPath, assetName, expectedHash);
-                    if (!metaOk)
-                    {
-                        RecordFailure(state, metaErr ?? "Release metadata validation failed");
-                        return false;
-                    }
-                }
+                RecordFailure(state, "Failed to download release-metadata.json");
+                return false;
+            }
+
+            var metadataPath = Path.Combine(tempRoot, "release-metadata.json");
+            var expectedHash = GetExpectedHash(checksumsPath, assetName);
+            var (metaOk, metaErr) = _provenanceVerifier.ValidateReleaseMetadata(
+                metadataPath,
+                assetName,
+                expectedHash,
+                update.AvailableVersion);
+            if (!metaOk)
+            {
+                RecordFailure(state, metaErr ?? "Release metadata validation failed");
+                return false;
             }
 
             // On Windows, Authenticode applies to the extracted executable rather than the ZIP container.
             // On Linux/macOS, official release archives are attested in the tag-bound release workflow.
             if (!OperatingSystem.IsWindows() && !update.IsDevBuild && !skipProvenance)
             {
-                var (archiveTrustOk, archiveTrustErr) = await _provenanceVerifier.VerifyBinaryTrustAsync(archivePath, $"refs/tags/{update.ReleaseTag}", ct);
+                if (!_releaseService.DownloadReleaseAsset(
+                        update.ReleaseTag,
+                        "attestations.jsonl",
+                        tempRoot))
+                {
+                    RecordFailure(state, "Release does not contain attestations.jsonl");
+                    return false;
+                }
+
+                var (archiveTrustOk, archiveTrustErr) =
+                    await _provenanceVerifier.VerifyArchiveAttestationAsync(
+                        archivePath,
+                        $"refs/tags/{update.ReleaseTag}",
+                        Path.Combine(tempRoot, "attestations.jsonl"),
+                        ct);
                 if (!archiveTrustOk)
                 {
                     RecordFailure(state, archiveTrustErr ?? "Archive provenance verification failed");
@@ -325,11 +335,13 @@ public sealed class UpdateService
 
             // Extract archive
             var extractedBinary = GitHubReleaseService.ExtractReleaseArchive(archivePath, extractPath);
+            PayloadInstaller.ValidateManifest(extractPath);
 
-            // Verify provenance of extracted binary on Windows only.
+            // Verify every executable payload file on Windows.
             if (OperatingSystem.IsWindows() && !update.IsDevBuild && !skipProvenance)
             {
-                var (trustOk, trustErr) = await _provenanceVerifier.VerifyBinaryTrustAsync(extractedBinary, $"refs/tags/{update.ReleaseTag}", ct);
+                var (trustOk, trustErr) =
+                    await _provenanceVerifier.VerifyWindowsPayloadAsync(extractPath, ct);
                 if (!trustOk)
                 {
                     RecordFailure(state, trustErr ?? "Provenance verification failed");
@@ -337,24 +349,35 @@ public sealed class UpdateService
                 }
             }
 
-            // Stage the verified binary next to the current executable
+            await PayloadInstaller.VerifyInstalledPayloadAsync(
+                extractPath,
+                update.AvailableVersion,
+                _logger,
+                ct);
+
+            // Stage the complete verified payload next to the install directory.
             var currentExePath = Environment.ProcessPath
                 ?? throw new InvalidOperationException("Cannot determine current executable path");
             var installDir = Path.GetDirectoryName(currentExePath)!;
             var binaryName = AppIdentity.GetExecutableFileName();
-            var stagedPath = Path.Combine(installDir, $"{binaryName}.staged");
-
-            File.Copy(extractedBinary, stagedPath, overwrite: true);
-
-            // Ensure the staged binary is executable on Unix
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(stagedPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
-                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            var parentDir = Path.GetDirectoryName(installDir)!;
+            var stagedDirectory = Path.Combine(
+                parentDir,
+                $".{Path.GetFileName(installDir)}.new-{Guid.NewGuid():N}");
+            var payloadFiles = PayloadInstaller.ValidateManifest(extractPath);
+            PayloadInstaller.CopyFiles(
+                extractPath,
+                stagedDirectory,
+                payloadFiles.Append(PayloadInstaller.ManifestFileName));
+            var stagedPath = Path.Combine(stagedDirectory, binaryName);
 
             state.Status = UpdateStatus.Staged;
             state.StagedVersion = update.AvailableVersion;
             state.StagedPath = stagedPath;
+            state.StagedDirectory = stagedDirectory;
+            state.BackupDirectory = Path.Combine(
+                parentDir,
+                $".{Path.GetFileName(installDir)}.old-{Guid.NewGuid():N}");
             ClearDeferredInstallMetadata(state);
             state.LastCheckTime = DateTimeOffset.UtcNow;
             state.ErrorMessage = null;
@@ -462,16 +485,16 @@ public sealed class UpdateService
         if ((state.Status != UpdateStatus.Staged
              && state.Status != UpdateStatus.WaitingForExit
              && state.Status != UpdateStatus.Installing)
-            || string.IsNullOrEmpty(state.StagedPath))
+            || string.IsNullOrEmpty(state.StagedDirectory))
         {
             _logger.LogWarning("No staged update found to install");
             return false;
         }
 
-        if (!File.Exists(state.StagedPath))
+        if (!Directory.Exists(state.StagedDirectory))
         {
-            _logger.LogWarning("Staged binary not found at '{Path}'", state.StagedPath);
-            RecordFailure(state, "Staged binary missing");
+            _logger.LogWarning("Staged payload not found at '{Path}'", state.StagedDirectory);
+            RecordFailure(state, "Staged payload missing");
             return false;
         }
 
@@ -512,12 +535,13 @@ public sealed class UpdateService
         ClearDeferredInstallMetadata(state);
         _stateStore.SaveUpdateState(state);
 
-        // Re-verify provenance of staged binary before install on Windows, where trust is bound to the executable itself.
+        // Re-verify every staged executable before install on Windows.
         if (OperatingSystem.IsWindows() && !skipProvenance && state.StagedVersion is not null)
         {
             if (VersionHelper.TryParse(state.StagedVersion, out var stagedVer) && !VersionHelper.IsDevBuild(stagedVer))
             {
-                var (trustOk, trustErr) = await _provenanceVerifier.VerifyBinaryTrustAsync(state.StagedPath, $"refs/tags/v{state.StagedVersion}", ct);
+                var (trustOk, trustErr) =
+                    await _provenanceVerifier.VerifyWindowsPayloadAsync(state.StagedDirectory, ct);
                 if (!trustOk)
                 {
                     RecordFailure(state, $"Pre-install provenance check failed: {trustErr}");
@@ -526,37 +550,46 @@ public sealed class UpdateService
             }
         }
 
-        // Perform binary replacement
         var currentExePath = Environment.ProcessPath
             ?? throw new InvalidOperationException("Cannot determine current executable path");
         var installDir = Path.GetDirectoryName(currentExePath)!;
-        var binaryName = AppIdentity.GetExecutableFileName();
-        var targetPath = Path.Combine(installDir, binaryName);
-        var oldPath = Path.Combine(installDir, $"{binaryName}.old");
+        var stagedDirectory = state.StagedDirectory;
+        var backupDirectory = state.BackupDirectory
+            ?? Path.Combine(
+                Path.GetDirectoryName(installDir)!,
+                $".{Path.GetFileName(installDir)}.old-{Guid.NewGuid():N}");
+        state.BackupDirectory = backupDirectory;
+        _stateStore.SaveUpdateState(state);
+
+        var newFiles = PayloadInstaller.ValidateManifest(stagedDirectory);
+        var managedFiles = PayloadInstaller.ReadManagedFiles(installDir)
+            .Concat(newFiles)
+            .Append(PayloadInstaller.ManifestFileName)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var mutationStarted = false;
 
         try
         {
-            // Rename current → old
-            if (File.Exists(targetPath))
-            {
-                if (File.Exists(oldPath))
-                    File.Delete(oldPath);
-                File.Move(targetPath, oldPath);
-                _logger.LogDebug("Renamed '{Target}' → '{Old}'", targetPath, oldPath);
-            }
+            Directory.CreateDirectory(installDir);
+            Directory.CreateDirectory(backupDirectory);
+            mutationStarted = true;
+            PayloadInstaller.BackupFiles(installDir, backupDirectory, managedFiles);
+            PayloadInstaller.DeleteFiles(installDir, managedFiles);
+            PayloadInstaller.CopyFiles(
+                stagedDirectory,
+                installDir,
+                newFiles.Append(PayloadInstaller.ManifestFileName));
+            await PayloadInstaller.VerifyInstalledPayloadAsync(
+                installDir,
+                state.StagedVersion
+                    ?? throw new UserFacingException("Staged update version is missing."),
+                _logger,
+                ct);
 
-            // Move staged → target
-            File.Move(state.StagedPath, targetPath);
-            _logger.LogDebug("Moved staged binary to '{Target}'", targetPath);
-
-            // Ensure the installed binary is executable on Unix
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(targetPath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
-                    | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
-                    | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
-
-            // Success — clear update state
             _stateStore.ClearUpdateState();
+            TryDeletePayloadDirectory(stagedDirectory);
+            TryDeletePayloadDirectory(backupDirectory);
             _logger.LogInformation("Update to {Version} installed successfully", state.StagedVersion);
             return true;
         }
@@ -564,14 +597,11 @@ public sealed class UpdateService
         {
             _logger.LogError(ex, "Failed to install staged binary, attempting rollback");
 
-            // Rollback: restore old binary
             try
             {
-                if (File.Exists(oldPath) && !File.Exists(targetPath))
-                {
-                    File.Move(oldPath, targetPath);
-                    _logger.LogInformation("Rollback succeeded — restored previous binary");
-                }
+                if (mutationStarted)
+                    PayloadInstaller.RestoreFiles(installDir, backupDirectory, managedFiles);
+                _logger.LogInformation("Rollback succeeded - restored previous managed payload");
             }
             catch (Exception rollbackEx)
             {
@@ -588,6 +618,7 @@ public sealed class UpdateService
     /// </summary>
     public async Task<bool> CheckAndStageAsync(bool allowPreRelease, bool skipProvenance, CancellationToken ct)
     {
+        ThrowIfDisabled();
         var state = _stateStore.LoadUpdateState();
 
         // Don't re-check if already staged or waiting for a deferred install
@@ -668,6 +699,26 @@ public sealed class UpdateService
                 _logger.LogDebug(ex, "Failed to clean up old binary (may still be in use)");
             }
         }
+
+        var state = _stateStore.LoadUpdateState();
+        var parentDirectory = Path.GetDirectoryName(Path.GetDirectoryName(currentExePath)!);
+        if (parentDirectory is null)
+            return;
+
+        var installDirectoryName = Path.GetFileName(Path.GetDirectoryName(currentExePath)!);
+        foreach (var pattern in new[] { $".{installDirectoryName}.new-*", $".{installDirectoryName}.old-*" })
+        {
+            foreach (var directory in Directory.EnumerateDirectories(parentDirectory, pattern))
+            {
+                if (PathsEqual(directory, state.StagedDirectory)
+                    || PathsEqual(directory, state.BackupDirectory))
+                {
+                    continue;
+                }
+
+                TryDeletePayloadDirectory(directory);
+            }
+        }
     }
 
     private void RecordFailure(UpdateState state, string message)
@@ -691,6 +742,9 @@ public sealed class UpdateService
 
         try
         {
+            var state = _stateStore.LoadUpdateState();
+            TryDeletePayloadDirectory(state.StagedDirectory);
+            TryDeletePayloadDirectory(state.BackupDirectory);
             try
             {
                 if (File.Exists(stagedPath))
@@ -711,6 +765,9 @@ public sealed class UpdateService
 
     private void ClearInterruptedInstallArtifactsCore(string stagedPath)
     {
+        var state = _stateStore.LoadUpdateState();
+        TryDeletePayloadDirectory(state.StagedDirectory);
+        TryDeletePayloadDirectory(state.BackupDirectory);
         try
         {
             if (File.Exists(stagedPath))
@@ -723,6 +780,50 @@ public sealed class UpdateService
 
         _stateStore.ClearUpdateState();
     }
+
+    private void TryDeletePayloadDirectory(string? directory)
+    {
+        if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            return;
+
+        var currentExePath = Environment.ProcessPath;
+        if (currentExePath is null)
+            return;
+
+        var installDirectory = Path.GetDirectoryName(currentExePath)!;
+        var expectedParent = Path.GetDirectoryName(installDirectory);
+        var directoryParent = Path.GetDirectoryName(Path.GetFullPath(directory));
+        var directoryName = Path.GetFileName(directory);
+        var expectedPrefix = $".{Path.GetFileName(installDirectory)}.";
+        if (expectedParent is null
+            || !string.Equals(expectedParent, directoryParent, StringComparison.OrdinalIgnoreCase)
+            || (!directoryName.StartsWith($"{expectedPrefix}new-", StringComparison.Ordinal)
+                && !directoryName.StartsWith($"{expectedPrefix}old-", StringComparison.Ordinal)))
+        {
+            _logger.LogWarning("Refusing to delete unexpected update payload directory '{Path}'", directory);
+            return;
+        }
+
+        try
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogDebug(ex, "Update payload directory '{Path}' remains in use and will be retried later", directory);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _logger.LogDebug(ex, "Update payload directory '{Path}' could not be removed and will be retried later", directory);
+        }
+    }
+
+    private static bool PathsEqual(string path, string? other)
+        => !string.IsNullOrWhiteSpace(other)
+            && string.Equals(
+                Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar),
+                Path.GetFullPath(other).TrimEnd(Path.DirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase);
 
     private async Task<bool> WaitForDaemonChainToExitAsync(int initialPid, DateTimeOffset initialStartTime, CancellationToken ct)
     {
@@ -947,25 +1048,32 @@ public sealed class UpdateService
         state.WatcherStartTime = null;
     }
 
-    private static string? GetExpectedHash(string checksumsPath, string assetName)
+    private static string GetExpectedHash(string checksumsPath, string assetName)
     {
-        try
+        foreach (var line in File.ReadLines(checksumsPath))
         {
-            var lines = File.ReadAllLines(checksumsPath);
-            foreach (var line in lines)
+            var parts = line.Split([' ', '*'], StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2
+                && parts[^1].Equals(assetName, StringComparison.OrdinalIgnoreCase)
+                && parts[0].Length == 64
+                && parts[0].All(Uri.IsHexDigit))
             {
-                if (!line.Contains(assetName, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                var parts = line.Split([' ', '*'], StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length >= 2 && parts[^1].Equals(assetName, StringComparison.OrdinalIgnoreCase)
-                    && parts[0].Length == 64)
-                {
-                    return parts[0].ToLowerInvariant();
-                }
+                return parts[0].ToLowerInvariant();
             }
         }
-        catch { /* best effort */ }
-        return null;
+
+        throw new UserFacingException(
+            $"checksums.txt does not contain a valid SHA256 entry for '{assetName}'.");
+    }
+
+    private static void ThrowIfDisabled()
+    {
+        var value = Environment.GetEnvironmentVariable(AppIdentity.DisableSelfUpdatesEnvVar);
+        if (value is not null
+            && value.Trim().ToLowerInvariant() is "1" or "true" or "yes" or "on")
+        {
+            throw new UserFacingException(
+                $"Self-update is disabled by {AppIdentity.DisableSelfUpdatesEnvVar}.");
+        }
     }
 }

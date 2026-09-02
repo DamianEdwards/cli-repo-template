@@ -69,6 +69,8 @@ command.SetAction(parseResult => ExecuteHandled(() =>
 
         var binaryPath = Path.Combine(assetDirectory, "templatecli.exe");
         EnsureFileExists(binaryPath, "Expanded Windows asset");
+        EnsureFileExists(Path.Combine(assetDirectory, "payload-manifest.json"), "Expanded Windows asset");
+        EnsurePayloadManifestMatches(assetDirectory);
 
         manifestEntries.Add(new WindowsAssetManifestEntry(asset.Name, asset.RuntimeIdentifier, assetDirectory));
     }
@@ -128,6 +130,39 @@ static void EnsureFileExists(string path, string description)
     }
 }
 
+static void EnsurePayloadManifestMatches(string directory)
+    {
+        const string manifestName = "payload-manifest.json";
+        var manifestPath = Path.Combine(directory, manifestName);
+        var manifest = JsonSerializer.Deserialize(
+            File.ReadAllText(manifestPath),
+            WindowsAssetsJsonContext.Default.PayloadManifest)
+            ?? throw new InvalidOperationException($"Payload manifest '{manifestPath}' could not be parsed.");
+        var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var declared = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? previousEntry = null;
+        foreach (var entry in manifest.Files)
+        {
+            if (string.IsNullOrWhiteSpace(entry) || Path.IsPathRooted(entry) || entry.Contains('\\'))
+                throw new InvalidOperationException($"Payload manifest contains invalid path '{entry}'.");
+            if (previousEntry is not null && StringComparer.Ordinal.Compare(previousEntry, entry) > 0)
+                throw new InvalidOperationException("Payload manifest paths are not sorted using ordinal comparison.");
+            previousEntry = entry;
+            var fullPath = Path.GetFullPath(Path.Combine(directory, entry.Replace('/', Path.DirectorySeparatorChar)));
+            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Payload manifest path '{entry}' is outside the payload.");
+            if (!declared.Add(Path.GetRelativePath(directory, fullPath)))
+                throw new InvalidOperationException($"Payload manifest contains duplicate path '{entry}'.");
+            EnsureFileExists(fullPath, "Payload manifest entry");
+        }
+        var actual = Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+            .Select(path => Path.GetRelativePath(directory, path))
+            .Where(path => !path.Equals(manifestName, StringComparison.OrdinalIgnoreCase))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (declared.Count == 0 || !declared.SetEquals(actual))
+            throw new InvalidOperationException($"Payload manifest '{manifestPath}' does not exactly describe the payload.");
+}
+
 static void Fail(string message)
 {
     Console.Error.WriteLine($"Error: {message}");
@@ -153,7 +188,10 @@ internal sealed record WindowsAssetManifestEntry(
     string RuntimeIdentifier,
     string StagingDirectory);
 
+internal sealed record PayloadManifest(IReadOnlyList<string> Files);
+
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, WriteIndented = true)]
 [JsonSerializable(typeof(ReleaseMetadataDocument))]
 [JsonSerializable(typeof(List<WindowsAssetManifestEntry>))]
+[JsonSerializable(typeof(PayloadManifest))]
 internal sealed partial class WindowsAssetsJsonContext : JsonSerializerContext;

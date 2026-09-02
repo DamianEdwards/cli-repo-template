@@ -6,7 +6,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $resolvedRoot = [System.IO.Path]::GetFullPath($RootPath)
-$scriptFiles = @(Get-ChildItem -Path $resolvedRoot -Recurse -Filter '*.ps1' -File)
+$scriptFiles = @(Get-ChildItem -Path $resolvedRoot -Recurse -Filter '*.ps1' -File |
+        Where-Object { $_.FullName -notmatch '[\\/](?:\.git|artifacts|bin|obj)[\\/]' })
 if ($scriptFiles.Count -eq 0)
 {
     throw "No PowerShell scripts were found under '$resolvedRoot'."

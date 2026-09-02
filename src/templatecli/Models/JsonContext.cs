@@ -39,4 +39,5 @@ public sealed class TolerantUpdateStatusConverter : JsonConverter<UpdateStatus>
     Converters = [typeof(TolerantUpdateStatusConverter)])]
 [JsonSerializable(typeof(TemplateCliConfig))]
 [JsonSerializable(typeof(UpdateState))]
+[JsonSerializable(typeof(PayloadManifest))]
 public partial class TemplateCliJsonContext : JsonSerializerContext;
