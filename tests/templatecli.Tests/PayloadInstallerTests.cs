@@ -28,6 +28,18 @@ public sealed class PayloadInstallerTests
     }
 
     [Fact]
+    public void ValidateInstalledManifestAllowsUnmanagedFiles()
+    {
+        using var fixture = new PayloadFixture();
+        File.WriteAllText(Path.Combine(fixture.Root, "user-file.txt"), "preserve me");
+
+        var files = PayloadInstaller.ValidateInstalledManifest(fixture.Root);
+
+        Assert.DoesNotContain("user-file.txt", files);
+        Assert.Contains(AppIdentity.GetExecutableFileName(), files);
+    }
+
+    [Fact]
     public void ValidateManifestRejectsPathTraversal()
     {
         using var fixture = new PayloadFixture();
