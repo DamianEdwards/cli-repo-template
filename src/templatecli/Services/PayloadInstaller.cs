@@ -11,6 +11,14 @@ public static class PayloadInstaller
     public const string ManifestFileName = "payload-manifest.json";
 
     public static IReadOnlyList<string> ValidateManifest(string payloadDirectory)
+        => ValidateManifest(payloadDirectory, requireExactInventory: true);
+
+    public static IReadOnlyList<string> ValidateInstalledManifest(string installDirectory)
+        => ValidateManifest(installDirectory, requireExactInventory: false);
+
+    private static IReadOnlyList<string> ValidateManifest(
+        string payloadDirectory,
+        bool requireExactInventory)
     {
         var manifestPath = Path.Combine(payloadDirectory, ManifestFileName);
         if (!File.Exists(manifestPath))
@@ -44,18 +52,21 @@ public static class PayloadInstaller
             previousEntry = entry;
         }
 
-        var actual = Directory.EnumerateFiles(payloadDirectory, "*", SearchOption.AllDirectories)
-            .Select(path => Path.GetRelativePath(payloadDirectory, path))
-            .Where(path => !path.Equals(ManifestFileName, StringComparison.OrdinalIgnoreCase))
-            .Select(path => path.Replace('\\', '/'))
-            .ToHashSet(StringComparer.Ordinal);
-        if (!declared.SetEquals(actual))
+        if (requireExactInventory)
         {
-            var undeclared = actual.Except(declared, StringComparer.Ordinal).ToArray();
-            throw new UserFacingException(
-                undeclared.Length > 0
-                    ? $"Update payload contains undeclared file(s): {string.Join(", ", undeclared)}."
-                    : "Update payload manifest does not match the extracted archive.");
+            var actual = Directory.EnumerateFiles(payloadDirectory, "*", SearchOption.AllDirectories)
+                .Select(path => Path.GetRelativePath(payloadDirectory, path))
+                .Where(path => !path.Equals(ManifestFileName, StringComparison.OrdinalIgnoreCase))
+                .Select(path => path.Replace('\\', '/'))
+                .ToHashSet(StringComparer.Ordinal);
+            if (!declared.SetEquals(actual))
+            {
+                var undeclared = actual.Except(declared, StringComparer.Ordinal).ToArray();
+                throw new UserFacingException(
+                    undeclared.Length > 0
+                        ? $"Update payload contains undeclared file(s): {string.Join(", ", undeclared)}."
+                        : "Update payload manifest does not match the extracted archive.");
+            }
         }
 
         var executableFileName = AppIdentity.GetExecutableFileName();
@@ -151,7 +162,7 @@ public static class PayloadInstaller
         ILogger logger,
         CancellationToken cancellationToken)
     {
-        ValidateManifest(installDirectory);
+        ValidateInstalledManifest(installDirectory);
         var executablePath = Path.Combine(installDirectory, AppIdentity.GetExecutableFileName());
         var startInfo = new ProcessStartInfo
         {
