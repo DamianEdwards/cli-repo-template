@@ -55,6 +55,9 @@ public sealed class UpdateState
     /// <summary>Directory retaining the previous managed payload until validation succeeds.</summary>
     public string? BackupDirectory { get; set; }
 
+    /// <summary>Whether the staged Windows payload requires Authenticode re-verification.</summary>
+    public bool WindowsPayloadSigned { get; set; }
+
     /// <summary>Daemon PID that a deferred installer should wait for before installing.</summary>
     public int? WaitForPid { get; set; }
 

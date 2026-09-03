@@ -1382,7 +1382,9 @@ function Invoke-TemplateCliInstall
         Invoke-GitHubAssetDownload -AssetUrl $releaseMetadataAsset.browser_download_url -AssetName 'release-metadata.json' -DestinationDirectory $tempRoot
         $releaseMetadata = Get-Content -LiteralPath $releaseMetadataPath -Raw | ConvertFrom-Json
         $expectedVersion = $release.tag_name -replace '^v', ''
-        if ($releaseMetadata.version -ne $expectedVersion -or $releaseMetadata.sourceCommit -notmatch '^[0-9a-fA-F]{40}$')
+        if ($releaseMetadata.version -ne $expectedVersion `
+            -or $releaseMetadata.sourceCommit -notmatch '^[0-9a-fA-F]{40}$' `
+            -or $releaseMetadata.windowsSigned -isnot [bool])
         {
             throw "release-metadata.json does not bind version and source commit to '$($release.tag_name)'."
         }
@@ -1397,7 +1399,7 @@ function Invoke-TemplateCliInstall
 
         $downloadedBinaryPath = Expand-WindowsReleaseArchive -ArchivePath $downloadPath -DestinationPath $extractPath
 
-        if ($Quality -ne 'Dev')
+        if ($Quality -ne 'Dev' -and $releaseMetadata.windowsSigned)
         {
             Invoke-StatusStep -Message 'Verifying asset provenance' -Action {
                 Get-ChildItem -LiteralPath $extractPath -File -Recurse |
@@ -1407,9 +1409,13 @@ function Invoke-TemplateCliInstall
                     }
             }
         }
-        else
+        elseif ($Quality -eq 'Dev')
         {
             Write-Host 'Skipping signature verification for development build; checksums remain enforced.'
+        }
+        else
+        {
+            Write-Warning 'This release declares unsigned Windows payloads; checksum and release metadata verification remain enforced.'
         }
 
         $installDirectory = [System.IO.Path]::GetFullPath($TargetPath)

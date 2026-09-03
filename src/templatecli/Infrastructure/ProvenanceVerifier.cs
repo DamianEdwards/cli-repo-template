@@ -290,7 +290,7 @@ public sealed class ProvenanceVerifier
     /// <summary>
     /// Validates that release-metadata.json agrees with checksums.txt for a given asset.
     /// </summary>
-    public (bool Success, string? Error) ValidateReleaseMetadata(
+    public (bool Success, bool WindowsSigned, string? Error) ValidateReleaseMetadata(
         string metadataPath,
         string assetName,
         string expectedSha256,
@@ -309,11 +309,26 @@ public sealed class ProvenanceVerifier
                     expectedVersion.TrimStart('v'),
                     StringComparison.OrdinalIgnoreCase))
             {
-                return (false, $"release-metadata.json did not identify expected version '{expectedVersion}'");
+                return (false, false, $"release-metadata.json did not identify expected version '{expectedVersion}'");
             }
 
+            if (!doc.RootElement.TryGetProperty("sourceCommit", out var sourceCommit)
+                || sourceCommit.ValueKind != JsonValueKind.String
+                || sourceCommit.GetString() is not { Length: 40 } sourceCommitValue
+                || !sourceCommitValue.All(Uri.IsHexDigit))
+            {
+                return (false, false, "release-metadata.json does not contain a valid sourceCommit");
+            }
+
+            if (!doc.RootElement.TryGetProperty("windowsSigned", out var windowsSignedElement)
+                || windowsSignedElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                return (false, false, "release-metadata.json does not contain a boolean windowsSigned value");
+            }
+            var windowsSigned = windowsSignedElement.GetBoolean();
+
             if (!doc.RootElement.TryGetProperty("assets", out var assets))
-                return (false, "release-metadata.json does not contain 'assets' array");
+                return (false, windowsSigned, "release-metadata.json does not contain 'assets' array");
 
             foreach (var asset in assets.EnumerateArray())
             {
@@ -321,22 +336,22 @@ public sealed class ProvenanceVerifier
                     string.Equals(nameEl.GetString(), assetName, StringComparison.OrdinalIgnoreCase))
                 {
                     if (!asset.TryGetProperty("sha256", out var sha256El))
-                        return (false, $"release-metadata.json asset '{assetName}' missing sha256 field");
+                        return (false, windowsSigned, $"release-metadata.json asset '{assetName}' missing sha256 field");
 
                     var metadataSha = sha256El.GetString()?.ToLowerInvariant();
                     if (!string.Equals(metadataSha, expectedSha256, StringComparison.OrdinalIgnoreCase))
-                        return (false, $"release-metadata.json SHA256 for '{assetName}' ({metadataSha}) does not match checksums.txt ({expectedSha256})");
+                        return (false, windowsSigned, $"release-metadata.json SHA256 for '{assetName}' ({metadataSha}) does not match checksums.txt ({expectedSha256})");
 
                     _logger.LogDebug("Release metadata validated for '{AssetName}'", assetName);
-                    return (true, null);
+                    return (true, windowsSigned, null);
                 }
             }
 
-            return (false, $"release-metadata.json did not contain asset '{assetName}'");
+            return (false, windowsSigned, $"release-metadata.json did not contain asset '{assetName}'");
         }
         catch (Exception ex)
         {
-            return (false, $"Failed to parse release-metadata.json: {ex.Message}");
+            return (false, false, $"Failed to parse release-metadata.json: {ex.Message}");
         }
     }
 
