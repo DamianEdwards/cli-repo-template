@@ -1,25 +1,23 @@
-name: Release
+name: Finalize App Release
 
 on:
   workflow_dispatch:
     inputs:
       ci_run_id:
-        description: CI run ID to promote into this tagged release.
+        description: CI run ID promoted by Start App Release.
         required: true
         type: string
       default_post_release_phase:
-        description: Phase for the next version after a successful release (pre, rc, rtm).
+        description: Phase after a successful stable release.
         required: false
         default: pre
         type: choice
-        options:
-          - pre
-          - rc
-          - rtm
+        options: [pre, rc, rtm]
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-state
   cancel-in-progress: false
+  queue: max
 
 env:
   DOTNET_NOLOGO: true
@@ -29,97 +27,142 @@ env:
 jobs:
   prepare-release:
     runs-on: ubuntu-latest
-
     permissions:
-      contents: read
       actions: read
-
+      contents: read
     outputs:
       version: ${{ steps.context.outputs.version }}
       ci_run_id: ${{ steps.context.outputs.ci_run_id }}
       is_prerelease: ${{ steps.context.outputs.is_prerelease }}
-      default_post_release_phase: ${{ steps.context.outputs.default_post_release_phase }}
+      default_phase: ${{ steps.context.outputs.default_phase }}
       state_json: ${{ steps.context.outputs.state_json }}
-
+      release_exists: ${{ steps.context.outputs.release_exists }}
+      state_needs_advance: ${{ steps.context.outputs.state_needs_advance }}
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3ced7
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
         with:
           dotnet-version: '10.0.x'
 
-      - name: Resolve tag context
+      - name: Validate tagged release context
         id: context
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-
+          test '${{ github.ref_type }}' = tag ||
+            { echo "::error::Finalize App Release must run from an approved v* tag."; exit 1; }
           TAG='${{ github.ref_name }}'
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] ||
+            { echo "::error::Invalid release tag '${TAG}'."; exit 1; }
           VERSION="${TAG#v}"
-          CI_RUN_ID='${{ github.event.inputs.ci_run_id }}'
-          DEFAULT_PHASE='${{ github.event.inputs.default_post_release_phase }}'
+          CI_RUN_ID='${{ inputs.ci_run_id }}'
+          [[ "$CI_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid CI run ID."; exit 1; }
 
-          if [[ "$VERSION" == *-* ]]; then
-            IS_PRERELEASE=true
-          else
-            IS_PRERELEASE=false
+          RUN_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${CI_RUN_ID}")
+          test "$(jq -r '.name' <<< "$RUN_JSON")" = CI ||
+            { echo "::error::Run ${CI_RUN_ID} is not CI."; exit 1; }
+          test "$(jq -r '.path' <<< "$RUN_JSON")" = '.github/workflows/ci.yml' ||
+            { echo "::error::Run ${CI_RUN_ID} used the wrong workflow path."; exit 1; }
+          test "$(jq -r '.status' <<< "$RUN_JSON")" = completed ||
+            { echo "::error::Run ${CI_RUN_ID} is not complete."; exit 1; }
+          test "$(jq -r '.conclusion' <<< "$RUN_JSON")" = success ||
+            { echo "::error::Run ${CI_RUN_ID} did not succeed."; exit 1; }
+          RUN_EVENT=$(jq -r '.event' <<< "$RUN_JSON")
+          [[ "$RUN_EVENT" == push || "$RUN_EVENT" == workflow_dispatch ]] ||
+            { echo "::error::Run ${CI_RUN_ID} was not triggered by a main push or manual dispatch."; exit 1; }
+          test "$(jq -r '.head_branch' <<< "$RUN_JSON")" = main ||
+            { echo "::error::Run ${CI_RUN_ID} is not from main."; exit 1; }
+          test "$(jq -r '.head_repository.full_name' <<< "$RUN_JSON")" = '${{ github.repository }}' ||
+            { echo "::error::Run ${CI_RUN_ID} is from another repository."; exit 1; }
+          CI_HEAD_SHA=$(jq -r '.head_sha' <<< "$RUN_JSON")
+          TAG_SHA=$(git rev-list -n 1 "$TAG")
+          test "$TAG_SHA" = "$CI_HEAD_SHA" ||
+            { echo "::error::Tag ${TAG} points to ${TAG_SHA}, but CI run ${CI_RUN_ID} built ${CI_HEAD_SHA}."; exit 1; }
+
+          RELEASE_EXISTS=false
+          if gh api "repos/${{ github.repository }}/releases/tags/${TAG}" >/dev/null 2>"$RUNNER_TEMP/release-query.err"; then
+            RELEASE_EXISTS=true
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-query.err"; then
+            cat "$RUNNER_TEMP/release-query.err" >&2
+            exit 1
           fi
 
-          git fetch origin release-state >/dev/null 2>&1 || true
-          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
-            STATE_JSON=$(git show origin/release-state:version-state.json)
+          RELEASE_STATE_REF=$(git ls-remote --heads origin refs/heads/release-state)
+          if [ -n "$RELEASE_STATE_REF" ]; then
+            git fetch origin refs/heads/release-state:refs/remotes/origin/release-state
+            STATE_JSON=$(git show refs/remotes/origin/release-state:version-state.json)
           else
-            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            RELEASES_JSON=$(gh release list --repo '${{ github.repository }}' --json tagName,isDraft,isPrerelease --limit 1000)
             STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
           fi
+          EXPECTED_VERSION=$(dotnet scripts/version.cs calculate --state "$STATE_JSON" | jq -r '.rcVersion')
+          STATE_NEEDS_ADVANCE=true
+          if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+            if [ "$RELEASE_EXISTS" != true ]; then
+              echo "::error::Tag version ${VERSION} does not match current promotable version ${EXPECTED_VERSION}."
+              exit 1
+            fi
+            STATE_NEEDS_ADVANCE=false
+          fi
+
+          DEFAULT_PHASE='${{ inputs.default_post_release_phase }}'
+          [[ "$DEFAULT_PHASE" =~ ^(pre|rc|rtm)$ ]] ||
+            { echo "::error::Invalid post-release phase '${DEFAULT_PHASE}'."; exit 1; }
+          if [[ "$VERSION" == *-* ]]; then IS_PRERELEASE=true; else IS_PRERELEASE=false; fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "ci_run_id=${CI_RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
-          echo "default_post_release_phase=${DEFAULT_PHASE}" >> "$GITHUB_OUTPUT"
-          echo "state_json=$(echo "$STATE_JSON" | jq -c '.')" >> "$GITHUB_OUTPUT"
+          echo "default_phase=${DEFAULT_PHASE}" >> "$GITHUB_OUTPUT"
+          echo "state_json=$(jq -c . <<< "$STATE_JSON")" >> "$GITHUB_OUTPUT"
+          echo "release_exists=${RELEASE_EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "state_needs_advance=${STATE_NEEDS_ADVANCE}" >> "$GITHUB_OUTPUT"
 
-          echo "## Release Context" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Tag:** \`${TAG}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Version:** \`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **CI Run:** \`${CI_RUN_ID}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Prerelease:** \`${IS_PRERELEASE}\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Download promotable bundle from CI run
+      - name: Download promotable bundle
+        if: steps.context.outputs.release_exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ./artifacts
-          gh run download "${{ steps.context.outputs.ci_run_id }}" --repo "${{ github.repository }}" --name native-promotable-bundle --dir ./artifacts
+          gh run download '${{ steps.context.outputs.ci_run_id }}' \
+            --repo '${{ github.repository }}' \
+            --name native-promotable-bundle \
+            --dir ./artifacts
 
-      - name: Verify release metadata
+      - name: Verify release bundle
+        if: steps.context.outputs.release_exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
-
-          EXPECTED_VERSION='${{ steps.context.outputs.version }}'
-          METADATA_FILE='./artifacts/release-metadata.json'
-
-          if [ ! -f "$METADATA_FILE" ]; then
-            echo "::error::Missing release metadata file."
-            exit 1
+          METADATA=./artifacts/release-metadata.json
+          test -f "$METADATA" || { echo "::error::Missing release-metadata.json."; exit 1; }
+          test "$(jq -r '.version' "$METADATA")" = '${{ steps.context.outputs.version }}' ||
+            { echo "::error::Release metadata version mismatch."; exit 1; }
+          test "$(jq -r '.sourceCommit' "$METADATA")" = "$(git rev-list -n 1 '${{ github.ref_name }}')" ||
+            { echo "::error::Release metadata source commit mismatch."; exit 1; }
+          test "$(jq '[.assets[].runtimeIdentifier] | length > 0 and length == (unique | length)' "$METADATA")" = true ||
+            { echo "::error::Release metadata runtime inventory is empty or duplicated."; exit 1; }
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd ./artifacts && sha256sum --check checksums.txt)
+          else
+            (cd ./artifacts && shasum -a 256 --check checksums.txt)
           fi
-
-          ACTUAL_VERSION=$(jq -r '.version' "$METADATA_FILE")
-          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
-            echo "::error::Release metadata version mismatch. Expected '$EXPECTED_VERSION' but found '$ACTUAL_VERSION'."
-            exit 1
-          fi
+          METADATA_ASSETS=$(jq -r '.assets[].name' "$METADATA" | sort)
+          CHECKSUM_ASSETS=$(awk '{print $2}' ./artifacts/checksums.txt | sed 's/^\*//' | sort)
+          test "$METADATA_ASSETS" = "$CHECKSUM_ASSETS" ||
+            { echo "::error::Release metadata and checksum inventories differ."; exit 1; }
 
       - name: Upload unsigned release bundle
+        if: steps.context.outputs.release_exists != 'true'
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: release-unsigned-bundle
@@ -128,16 +171,20 @@ jobs:
 
   sign-windows:
     runs-on: windows-2022
-    needs: prepare-release
+    needs: [prepare-release]
+    if: needs.prepare-release.outputs.release_exists != 'true'
     environment: production
-
     permissions:
       contents: read
       id-token: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
 
       - name: Download unsigned release bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
@@ -149,8 +196,7 @@ jobs:
         shell: pwsh
         run: dotnet ./scripts/expand-windows-release-assets.cs -- --bundle-directory './artifacts/bundle' --working-directory './artifacts/windows-assets'
 
-      - name: Determine signing availability
-        id: signing
+      - name: Require signing configuration
         shell: pwsh
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -160,39 +206,25 @@ jobs:
           AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
         run: |
-          $required = @(
-            'AZURE_CLIENT_ID',
-            'AZURE_TENANT_ID',
-            'AZURE_SUBSCRIPTION_ID',
-            'AZURE_SIGNING_ENDPOINT',
-            'AZURE_SIGNING_ACCOUNT',
-            'AZURE_CERT_PROFILE'
-          )
+          $required = 'AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','AZURE_SIGNING_ENDPOINT','AZURE_SIGNING_ACCOUNT','AZURE_CERT_PROFILE'
           $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
-          if ($missing.Count -gt 0) {
-            "enabled=false" >> $env:GITHUB_OUTPUT
-            Write-Host "::warning::Skipping Windows signing because Azure signing secrets are not fully configured. Missing: $($missing -join ', ')"
-          } else {
-            "enabled=true" >> $env:GITHUB_OUTPUT
-          }
+          if ($missing.Count) { throw "Windows signing is mandatory. Missing secret(s): $($missing -join ', ')." }
 
       - name: Azure login
-        if: steps.signing.outputs.enabled == 'true'
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Sign Windows executables
-        if: steps.signing.outputs.enabled == 'true'
+      - name: Sign all Windows executable payloads
         uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
           files-folder: ${{ github.workspace }}\artifacts\windows-assets
-          files-folder-filter: templatecli.exe
+          files-folder-filter: exe,dll
           files-folder-recurse: true
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
@@ -208,31 +240,25 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
 
-      - name: Verify signed Windows issuer
-        if: steps.signing.outputs.enabled == 'true'
+      - name: Verify all signed Windows payloads
         shell: pwsh
         run: |
-          $binaryPaths = @(Get-ChildItem -Path './artifacts/windows-assets' -Recurse -Filter 'templatecli.exe' -File)
-          if ($binaryPaths.Count -eq 0) {
-            throw "No signed templatecli.exe files were found under './artifacts/windows-assets'."
-          }
-
-          foreach ($binaryPath in $binaryPaths) {
-            ./scripts/Verify-WindowsBinaryIssuer.ps1 -BinaryPath $binaryPath.FullName -InstallerScriptPath './scripts/install/install-templatecli.ps1'
+          $payloadRoots = @(Get-ChildItem './artifacts/windows-assets' -Directory)
+          if ($payloadRoots.Count -eq 0) { throw 'No expanded Windows payload directories were found.' }
+          foreach ($payloadRoot in $payloadRoots) {
+            $manifest = Get-Content (Join-Path $payloadRoot.FullName 'payload-manifest.json') -Raw | ConvertFrom-Json
+            $binaryPaths = @($manifest.files |
+              Where-Object { $_ -match '\.(exe|dll)$' } |
+              ForEach-Object { Join-Path $payloadRoot.FullName $_ })
+            if ($binaryPaths.Count -eq 0) { throw "Payload '$($payloadRoot.Name)' has no executable files." }
+            foreach ($binaryPath in $binaryPaths) {
+              ./scripts/Verify-WindowsBinaryIssuer.ps1 -BinaryPath $binaryPath -InstallerScriptPath './scripts/install/install-templatecli.ps1'
+            }
           }
 
       - name: Repack signed Windows assets
-        if: steps.signing.outputs.enabled == 'true'
         shell: pwsh
         run: dotnet ./scripts/compress-windows-release-assets.cs -- --working-directory './artifacts/windows-assets' --output-directory './artifacts/signed-windows-assets'
-
-      - name: Reuse unsigned Windows assets
-        if: steps.signing.outputs.enabled != 'true'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path './artifacts/signed-windows-assets' -Force | Out-Null
-          Get-ChildItem -Path './artifacts/bundle' -Filter 'templatecli-win-*.zip' -File | Copy-Item -Destination './artifacts/signed-windows-assets' -Force
-          Write-Host "Continuing with unsigned Windows archives because Azure signing configuration is not present yet."
 
       - name: Upload signed Windows assets
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -244,96 +270,125 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs: [prepare-release, sign-windows]
-
+    if: ${{ always() && needs.prepare-release.result == 'success' && (needs.sign-windows.result == 'success' || needs.sign-windows.result == 'skipped') }}
     permissions:
+      attestations: write
       contents: write
       id-token: write
-      attestations: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Download unsigned release bundle
+        if: needs.prepare-release.outputs.release_exists != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-unsigned-bundle
           path: ./artifacts/release
 
       - name: Download signed Windows assets
+        if: needs.prepare-release.outputs.release_exists != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-signed-windows-assets
           path: ./artifacts/signed-windows-assets
 
-      - name: Overlay signed Windows assets
+      - name: Overlay signed assets and regenerate metadata
+        if: needs.prepare-release.outputs.release_exists != 'true'
         shell: pwsh
-        run: Copy-Item './artifacts/signed-windows-assets/*' './artifacts/release' -Force
+        run: |
+          Copy-Item './artifacts/signed-windows-assets/*' './artifacts/release' -Force
+          dotnet ./scripts/update-release-bundle-metadata.cs -- --bundle-directory './artifacts/release'
 
-      - name: Regenerate release metadata
-        shell: pwsh
-        run: dotnet ./scripts/update-release-bundle-metadata.cs -- --bundle-directory './artifacts/release'
-
-      - name: Verify updated release metadata
+      - name: Verify final bundle
+        if: needs.prepare-release.outputs.release_exists != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          EXPECTED_VERSION='${{ needs.prepare-release.outputs.version }}'
-          ACTUAL_VERSION=$(jq -r '.version' './artifacts/release/release-metadata.json')
-          if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
-            echo "::error::Release metadata version mismatch after signing. Expected '$EXPECTED_VERSION' but found '$ACTUAL_VERSION'."
-            exit 1
+          test "$(jq -r '.version' ./artifacts/release/release-metadata.json)" = '${{ needs.prepare-release.outputs.version }}'
+          test "$(jq -r '.sourceCommit' ./artifacts/release/release-metadata.json)" = "$(git rev-list -n 1 '${{ github.ref_name }}')"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd ./artifacts/release && sha256sum --check checksums.txt)
+          else
+            (cd ./artifacts/release && shasum -a 256 --check checksums.txt)
           fi
 
       - name: Attest final release archives
+        id: attest
+        if: needs.prepare-release.outputs.release_exists != 'true'
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26
         with:
           subject-path: |
             ./artifacts/release/templatecli-*.zip
             ./artifacts/release/templatecli-*.tar.gz
 
-      - name: Create GitHub release
+      - name: Stage portable attestation bundle
+        if: needs.prepare-release.outputs.release_exists != 'true'
+        shell: bash
+        run: cp '${{ steps.attest.outputs.bundle-path }}' ./artifacts/release/attestations.jsonl
+
+      - name: Create immutable GitHub release
+        if: needs.prepare-release.outputs.release_exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-
           TAG='${{ github.ref_name }}'
-          VERSION='${{ needs.prepare-release.outputs.version }}'
-          IS_PRERELEASE='${{ needs.prepare-release.outputs.is_prerelease }}'
-
+          if gh api "repos/${{ github.repository }}/releases/tags/${TAG}" >/dev/null 2>"$RUNNER_TEMP/release-query.err"; then
+            echo "::error::Release ${TAG} already exists; refusing to delete or recreate it."
+            exit 1
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-query.err"; then
+            cat "$RUNNER_TEMP/release-query.err" >&2
+            exit 1
+          fi
           EXTRA_ARGS=()
-          if [ "$IS_PRERELEASE" = "true" ]; then
+          if [ '${{ needs.prepare-release.outputs.is_prerelease }}' = true ]; then
             EXTRA_ARGS+=(--prerelease --latest=false)
           fi
-
-          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
-            gh release delete "$TAG" --repo "${{ github.repository }}" --yes
-          fi
-
           gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo '${{ github.repository }}' \
             "${EXTRA_ARGS[@]}" \
             --title "$TAG" \
             --generate-notes \
             ./artifacts/release/*
 
-      - name: Advance release state
+      - name: Verify existing release before recovery
+        if: needs.prepare-release.outputs.release_exists == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+          TAG='${{ github.ref_name }}'
+          mkdir -p ./artifacts/existing-release
+          gh release download "$TAG" --repo '${{ github.repository }}' --dir ./artifacts/existing-release
+          METADATA=./artifacts/existing-release/release-metadata.json
+          test "$(jq -r '.version' "$METADATA")" = '${{ needs.prepare-release.outputs.version }}'
+          test "$(jq -r '.sourceCommit' "$METADATA")" = "$(git rev-list -n 1 "$TAG")"
+          test -s ./artifacts/existing-release/attestations.jsonl
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd ./artifacts/existing-release && sha256sum --check checksums.txt)
+          else
+            (cd ./artifacts/existing-release && shasum -a 256 --check checksums.txt)
+          fi
 
-          STATE_JSON='${{ needs.prepare-release.outputs.state_json }}'
-          VERSION='${{ needs.prepare-release.outputs.version }}'
-          DEFAULT_PHASE='${{ needs.prepare-release.outputs.default_post_release_phase }}'
-
-          NEW_STATE_JSON=$(dotnet scripts/version.cs advance --state "$STATE_JSON" --shipped-version "$VERSION" --default-phase "$DEFAULT_PHASE")
-
+      - name: Advance release state
+        if: needs.prepare-release.outputs.state_needs_advance == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEW_STATE_JSON=$(dotnet scripts/version.cs advance \
+            --state '${{ needs.prepare-release.outputs.state_json }}' \
+            --shipped-version '${{ needs.prepare-release.outputs.version }}' \
+            --default-phase '${{ needs.prepare-release.outputs.default_phase }}')
           mkdir -p ./artifacts/release-state
           printf '%s\n' "$NEW_STATE_JSON" > ./artifacts/release-state/version-state.json
-          bash ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Advance release state after ${VERSION}"
+          bash ./scripts/publish-branch-content.sh release-state ./artifacts/release-state "Advance release state after ${{ needs.prepare-release.outputs.version }}"

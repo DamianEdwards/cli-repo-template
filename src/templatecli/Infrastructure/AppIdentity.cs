@@ -13,4 +13,8 @@ public static class AppIdentity
 
     public static string GetExecutableFileName()
         => OperatingSystem.IsWindows() ? $"{CommandName}.exe" : CommandName;
+
+    public static bool IsWindowsExecutablePayloadFile(string relativePath)
+        => relativePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            || relativePath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase);
 }

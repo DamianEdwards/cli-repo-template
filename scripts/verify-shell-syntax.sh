@@ -11,7 +11,8 @@ if [[ ! -d "$ROOT_PATH" ]]; then
     exit 1
 fi
 
-mapfile -t script_files < <(find "$ROOT_PATH" -name '*.sh' -type f -not -path '*/.git/*' | sort)
+mapfile -t script_files < <(find "$ROOT_PATH" -name '*.sh' -type f \
+    -not -path '*/.git/*' -not -path '*/artifacts/*' -not -path '*/bin/*' -not -path '*/obj/*' | sort)
 
 if [[ ${#script_files[@]} -eq 0 ]]; then
     echo "Error: No shell scripts were found under '$ROOT_PATH'." >&2

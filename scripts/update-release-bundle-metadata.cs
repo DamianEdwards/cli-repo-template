@@ -51,6 +51,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
 
     var updatedMetadata = new ReleaseMetadataDocument(
         metadata.Version,
+        metadata.SourceCommit,
         updatedAssets,
         updatedAssets.Where(asset => string.Equals(asset.Platform, "win", StringComparison.Ordinal)).ToArray());
 
@@ -124,6 +125,7 @@ static void Fail(string message)
 
 internal sealed record ReleaseMetadataDocument(
     string Version,
+    string? SourceCommit,
     IReadOnlyList<ReleaseAsset> Assets,
     IReadOnlyList<ReleaseAsset> WindowsAssets);
 

@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/templatecli/templatecli.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/templatecli.Tests/templatecli.Tests.csproj" />
+  </Folder>
 </Solution>

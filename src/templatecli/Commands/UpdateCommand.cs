@@ -80,9 +80,7 @@ public static class UpdateCommand
                     return 1;
                 }
 
-                var preRelease = useStableOnly
-                    ? false
-                    : usePreRelease || config.IncludePrereleaseUpdates;
+                var preRelease = usePreRelease || config.IncludePrereleaseUpdates;
 
                 DateTimeOffset? waitForStartTime = null;
                 if (!string.IsNullOrWhiteSpace(waitForStartTimeRaw))
@@ -138,7 +136,7 @@ public static class UpdateCommand
                 }
 
                 if (check)
-                    return HandleCheckOnly(updateService, preRelease);
+                    return HandleCheckOnly(updateService, preRelease, useStableOnly);
 
                 if (!runtimeContext.SupportsInPlaceSelfUpdate() && runtimeContext.GetUnsupportedSelfUpdateReason() is { } unsupportedReason)
                 {
@@ -146,7 +144,14 @@ public static class UpdateCommand
                     return 1;
                 }
 
-                return await HandleFullUpdate(updateService, stateStore, preRelease, skipProvenance, dryRun, ct);
+                return await HandleFullUpdate(
+                    updateService,
+                    stateStore,
+                    preRelease,
+                    useStableOnly,
+                    skipProvenance,
+                    dryRun,
+                    ct);
             }, logger);
         });
 
@@ -181,10 +186,13 @@ public static class UpdateCommand
         return 1;
     }
 
-    private static int HandleCheckOnly(UpdateService updateService, bool preRelease)
+    private static int HandleCheckOnly(
+        UpdateService updateService,
+        bool preRelease,
+        bool stableOnly)
     {
         ConsoleOutput.Info("Checking for updates...");
-        var update = updateService.CheckForUpdate(preRelease);
+        var update = updateService.CheckForUpdate(preRelease, stableOnly);
         if (update is null)
         {
             ConsoleOutput.Success($"{AppIdentity.CommandName} is up to date.");
@@ -200,12 +208,13 @@ public static class UpdateCommand
         UpdateService updateService,
         StateStore stateStore,
         bool preRelease,
+        bool stableOnly,
         bool skipProvenance,
         bool dryRun,
         CancellationToken ct)
     {
         ConsoleOutput.Info("Checking for updates...");
-        var update = updateService.CheckForUpdate(preRelease);
+        var update = updateService.CheckForUpdate(preRelease, stableOnly);
         if (update is null)
         {
             ConsoleOutput.Success($"{AppIdentity.CommandName} is up to date.");

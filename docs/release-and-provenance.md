@@ -1,20 +1,20 @@
 # Release, signing, and provenance
 
-This template includes content and workflows for GitHub Releases-based distribution, optional Azure signing (for Windows assets), and provenance verification. The included release workflows are designed to be functional out of the box with minimal configuration, while also supporting optional signing and provenance features that can be enabled as needed.
+This template includes workflows for GitHub Releases-based distribution, required production signing for Windows assets, and portable provenance verification.
 
 ## Release channels
 
 The template uses three release channels:
 
-- **Dev** - public immutable prerelease builds published directly from `ci.yml`; install/update intentionally skip provenance verification for this channel
+- **Dev** - public immutable prerelease builds published directly from `ci.yml`; install/update skip provenance verification but still require release metadata and checksums
 - **Pre-release** - official tagged releases published by `release.yml`
 - **Stable** - official tagged releases published by `release.yml` and eligible to become the repo latest release
 
 ## Workflow split
 
 - `ci.yml` builds and tests assets, publishes a public immutable Dev release, uploads a promotable bundle, and advances the mutable `release-state` branch
-- `publish-release.yml` is the admin-run promotion workflow; it chooses the current official version, creates the release tag, and dispatches `release.yml` on that tag ref
-- `release.yml` runs on the release tag ref, downloads the already-built CI bundle, signs Windows assets, regenerates metadata/checksums after signing, attests the final release archives, publishes the GitHub release, and advances `release-state`
+- `publish-release.yml` is **Start App Release**, the normal manual entry point. It binds promotion to the exact successful CI run, repository, `main` commit, version, checksums, inventory, and source commit before dispatching the finalizer.
+- `release.yml` is **Finalize App Release**. It runs on the immutable release tag, requires production signing, publishes release-local `attestations.jsonl`, preserves an existing immutable release on rerun, and resumes only unfinished release-state advancement. Do not run it manually during normal operation.
 - `bump-version.yml` updates the mutable `release-state` branch when you want to move between `pre`, `rc`, and `rtm` lines or bump the base version ahead of the next CI/dev cycle
 - `releases-cleanup.yml` runs on a schedule or manually to delete old Dev releases and old install-script snapshot releases while keeping the latest five of each by default
 
@@ -22,8 +22,8 @@ The template uses three release channels:
 
 Install scripts are published independently of software releases:
 
-- `install-scripts.yml` signs/stages the latest bootstrap scripts from `main`, publishes them to the mutable `install-scripts` branch, tags that snapshot, and dispatches `attest-install-scripts.yml` on that tag ref
-- `attest-install-scripts.yml` creates the immutable install-script snapshot release and publishes tag-bound attestations for the scripts
+- `install-scripts.yml` is **Start Install Script Release**, the normal manual entry point. It signs/stages the latest bootstrap scripts from `main`, publishes them to the mutable `install-scripts` branch, tags that snapshot, and dispatches the finalizer.
+- `attest-install-scripts.yml` is **Finalize Install Script Release**. It validates the annotated tag, source commit, ancestry, signature, checksums, and inventory before creating the immutable snapshot and its portable attestation bundle. Do not run it manually during normal operation.
 
 Latest bootstrap URLs come from the branch, for example:
 
@@ -93,13 +93,9 @@ Recommended rules:
 
 `releases-cleanup.yml` deletes old install-script GitHub releases but intentionally leaves their protected snapshot tags in place. Dev cleanup deletes both the old Dev release and its tag because Dev tags are workflow-generated rolling build outputs.
 
-## Optional repository configuration
+## Required signing configuration
 
-The release and installer workflows are designed to work before signing is configured.
-
-### Optional Azure signing secrets
-
-If all of these secrets are present, Windows binaries and the PowerShell installer are signed:
+Official application releases and install-script publication fail closed unless all production signing secrets are present:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`
@@ -108,22 +104,22 @@ If all of these secrets are present, Windows binaries and the PowerShell install
 - `AZURE_SIGNING_ACCOUNT`
 - `AZURE_CERT_PROFILE`
 
-If any are missing, the workflows log a warning and continue with unsigned artifacts instead of failing.
-
 ### Optional repository variables
 
 - `DEFAULT_POST_RELEASE_PHASE` - optional default for the post-release version bump phase (`pre`, `rc`, or `rtm`)
 
 ### Optional environment variables at install/update time
 
-- `GITHUB_TOKEN` or `GH_TOKEN` - optional for GitHub attestation bundle downloads, useful for private repositories or avoiding anonymous API rate limits
+- `GITHUB_TOKEN` or `GH_TOKEN` - optional for GitHub release API access, useful for private repositories or avoiding anonymous API rate limits
+- `TEMPLATECLI_DISABLE_SELF_UPDATES` - disables automatic and explicit self-update checks
 
 ## Provenance and trust model
 
 - The Windows installer script remains the single source of truth for Authenticode trust configuration. `Generate-VerifyProvenance.ps1` derives the embedded verifier from it during build.
-- On Linux/macOS, the CLI self-update path verifies GitHub attestation bundles locally with the `Sigstore` NuGet package instead of shelling out to `gh attestation verify`.
+- Release assets carry a stable, sorted `payload-manifest.json` that defines the exact managed payload. Install and update replace only previously managed files and preserve unrelated files.
+- On Linux/macOS, the CLI self-update path verifies the release-local `attestations.jsonl` portable Sigstore bundles with the `Sigstore` NuGet package.
 - Official Pre-release and Stable assets are attested in `release.yml` on the exact release tag ref, and Unix verification pins to that workflow + tag combination.
-- On Linux/macOS, `install-templatecli.sh` verifies GitHub attestation bundles with `cosign`. `cosign` is therefore a prerequisite unless `--skip-provenance` is used or a Dev build is being installed.
+- On Linux/macOS, `install-templatecli.sh` verifies release-local portable bundles with `cosign`. `cosign` is therefore a prerequisite unless `--skip-provenance` is used or a Dev build is being installed.
 - For macOS, the recommended `cosign` install path is Homebrew: `brew install cosign`. On Linux, the installer prints package-manager-specific guidance where possible and otherwise points to the official Cosign install docs.
 - If you use a local update source via `TEMPLATECLI_UPDATE_SOURCE`, provenance verification for Unix self-update is intentionally not supported; use `templatecli update --skip-provenance-checks` for local testing scenarios.
 

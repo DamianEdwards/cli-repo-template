@@ -25,6 +25,7 @@ on:
 concurrency:
   group: release-state
   cancel-in-progress: false
+  queue: max
 
 env:
   DOTNET_NOLOGO: true
@@ -34,6 +35,7 @@ env:
 jobs:
   bump:
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
 
     permissions:
       contents: write
@@ -56,16 +58,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch origin release-state >/dev/null 2>&1 || true
-
-          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
-            STATE_JSON=$(git show origin/release-state:version-state.json)
+          RELEASE_STATE_REF=$(git ls-remote --heads origin refs/heads/release-state)
+          if [ -n "$RELEASE_STATE_REF" ]; then
+            git fetch origin refs/heads/release-state:refs/remotes/origin/release-state
+            STATE_JSON=$(git show refs/remotes/origin/release-state:version-state.json)
           else
-            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 1000)
             STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
           fi
 
-          RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+          RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 1000)
           NEW_STATE_JSON=$(dotnet scripts/version.cs bump --state "$STATE_JSON" --version-bump "${{ github.event.inputs.version_bump }}" --phase "${{ github.event.inputs.phase }}" --releases-json "$RELEASES_JSON")
           VERSIONS_JSON=$(dotnet scripts/version.cs calculate --state "$NEW_STATE_JSON")
           DEV_VERSION=$(echo "$VERSIONS_JSON" | jq -r '.devVersion')

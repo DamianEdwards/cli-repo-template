@@ -55,11 +55,18 @@ public static class VersionHelper
     ///   <item>Stable builds → newer stable only (unless <paramref name="allowPreRelease"/>)</item>
     /// </list>
     /// </summary>
-    public static bool IsUpdateCandidate(NuGetVersion current, NuGetVersion candidate, bool allowPreRelease)
+    public static bool IsUpdateCandidate(
+        NuGetVersion current,
+        NuGetVersion candidate,
+        bool allowPreRelease,
+        bool stableOnly = false)
     {
         // Candidate must be strictly newer
         if (candidate.CompareTo(current) <= 0)
             return false;
+
+        if (stableOnly)
+            return IsStableBuild(candidate);
 
         // Dev builds accept anything newer
         if (IsDevBuild(current))

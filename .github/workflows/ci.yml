@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths-ignore:
       - '**/*.md'
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: release-state
   cancel-in-progress: false
+  queue: max
 
 env:
   DOTNET_NOLOGO: true
@@ -59,13 +61,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ '${{ github.event_name }}' = workflow_dispatch ] && [ '${{ github.ref }}' != refs/heads/main ]; then
+            echo "::error::Manual CI dispatch must target main."
+            exit 1
+          fi
 
-          git fetch origin release-state >/dev/null 2>&1 || true
-
-          if git show-ref --verify --quiet refs/remotes/origin/release-state; then
-            STATE_JSON=$(git show origin/release-state:version-state.json)
+          RELEASE_STATE_REF=$(git ls-remote --heads origin refs/heads/release-state)
+          if [ -n "$RELEASE_STATE_REF" ]; then
+            git fetch origin refs/heads/release-state:refs/remotes/origin/release-state
+            STATE_JSON=$(git show refs/remotes/origin/release-state:version-state.json)
           else
-            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 100 2>/dev/null || echo "[]")
+            RELEASES_JSON=$(gh release list --repo "${{ github.repository }}" --json tagName,isDraft,isPrerelease --limit 1000)
             STATE_JSON=$(dotnet scripts/version.cs state --releases-json "$RELEASES_JSON")
           fi
 
@@ -100,8 +106,27 @@ jobs:
           validate-native-aot: 'true'
           aot-runtime-identifier: linux-x64
 
+  test:
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Test
+        run: dotnet test cli-repo-template.slnx --configuration Release --nologo --tl:off
+
   publish-dev:
-    needs: [version, build, validate-scripts]
+    needs: [version, build, test, validate-scripts]
     strategy:
       fail-fast: false
       matrix:
@@ -137,7 +162,7 @@ jobs:
           artifact-name: native-dev-${{ matrix.rid }}
 
   publish-promotable:
-    needs: [version, build, validate-scripts]
+    needs: [version, build, test, validate-scripts]
     strategy:
       fail-fast: false
       matrix:
@@ -192,7 +217,7 @@ jobs:
 
       - name: Create dev bundle
         shell: bash
-        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/dev' --output-directory './bundle/dev' --release-version '${{ needs.version.outputs.dev_version }}'
+        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/dev' --output-directory './bundle/dev' --release-version '${{ needs.version.outputs.dev_version }}' --source-commit '${{ github.sha }}'
 
       - name: Upload dev bundle artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
@@ -228,7 +253,7 @@ jobs:
 
       - name: Create promotable bundle
         shell: bash
-        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/promotable' --output-directory './bundle/promotable' --release-version '${{ needs.version.outputs.release_version }}'
+        run: dotnet ./scripts/merge-release-bundle.cs -- --input-directory './artifacts/promotable' --output-directory './bundle/promotable' --release-version '${{ needs.version.outputs.release_version }}' --source-commit '${{ github.sha }}'
 
       - name: Upload promotable bundle artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f

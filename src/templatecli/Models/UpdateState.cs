@@ -49,6 +49,12 @@ public sealed class UpdateState
     /// <summary>Full path to the staged binary (e.g. templatecli.exe.staged).</summary>
     public string? StagedPath { get; set; }
 
+    /// <summary>Directory containing the complete verified payload.</summary>
+    public string? StagedDirectory { get; set; }
+
+    /// <summary>Directory retaining the previous managed payload until validation succeeds.</summary>
+    public string? BackupDirectory { get; set; }
+
     /// <summary>Daemon PID that a deferred installer should wait for before installing.</summary>
     public int? WaitForPid { get; set; }
 
