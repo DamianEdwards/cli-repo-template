@@ -130,6 +130,8 @@ jobs:
             { echo "::error::CI bundle version does not match ${VERSION}."; exit 1; }
           test "$(jq -r '.sourceCommit' "$METADATA")" = "$CI_HEAD_SHA" ||
             { echo "::error::CI bundle source commit does not match ${CI_HEAD_SHA}."; exit 1; }
+          test "$(jq -r '.windowsSigned' "$METADATA")" = false ||
+            { echo "::error::Promotable CI metadata must identify unsigned Windows assets."; exit 1; }
           test "$(jq '[.assets[].runtimeIdentifier] | length > 0 and length == (unique | length)' "$METADATA")" = true ||
             { echo "::error::CI bundle runtime inventory is empty or duplicated."; exit 1; }
           if command -v sha256sum >/dev/null 2>&1; then

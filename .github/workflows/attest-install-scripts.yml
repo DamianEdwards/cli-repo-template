@@ -24,6 +24,7 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Verify snapshot identity and contents
+        id: snapshot
         shell: bash
         run: |
           set -euo pipefail
@@ -36,6 +37,8 @@ jobs:
           test -f ./install-scripts.json
           test -f ./checksums.txt
           test "$(jq -r '.version' ./install-scripts.json)" = '${{ github.ref_name }}'
+          test "$(jq -r '.signed | type' ./install-scripts.json)" = boolean
+          echo "signed=$(jq -r '.signed' ./install-scripts.json)" >> "$GITHUB_OUTPUT"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum --check ./checksums.txt
           else
@@ -54,6 +57,7 @@ jobs:
             { echo "::error::Install scripts were not published from main."; exit 1; }
 
       - name: Verify install.ps1 Authenticode signature
+        if: steps.snapshot.outputs.signed == 'true'
         shell: pwsh
         run: |
           $signature = Get-AuthenticodeSignature -FilePath './install.ps1'

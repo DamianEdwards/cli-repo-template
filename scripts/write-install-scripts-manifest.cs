@@ -34,18 +34,24 @@ var sourceRefOption = new Option<string>("--source-ref")
     Description = "Source ref for the published scripts."
 };
 sourceRefOption.DefaultValueFactory = _ => "refs/heads/main";
+var signedOption = new Option<bool>("--signed")
+{
+    Description = "Whether install.ps1 was Authenticode signed."
+};
 
 var command = new RootCommand("Generate install-script checksums and manifest metadata.");
 command.Options.Add(directoryOption);
 command.Options.Add(manifestVersionOption);
 command.Options.Add(sourceCommitOption);
 command.Options.Add(sourceRefOption);
+command.Options.Add(signedOption);
 command.SetAction(parseResult => ExecuteHandled(() =>
 {
     var directory = Path.GetFullPath(parseResult.GetValue(directoryOption)!);
     var manifestVersion = parseResult.GetValue(manifestVersionOption)!;
     var sourceCommit = parseResult.GetValue(sourceCommitOption)!;
     var sourceRef = parseResult.GetValue(sourceRefOption)!;
+    var signed = parseResult.GetValue(signedOption);
 
     var installPs1Path = Path.Combine(directory, "install.ps1");
     var installShPath = Path.Combine(directory, "install.sh");
@@ -67,6 +73,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
         Version: manifestVersion,
         SourceCommit: sourceCommit,
         SourceRef: sourceRef,
+        Signed: signed,
         PublishedAt: DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
         Scripts:
         [
@@ -134,6 +141,7 @@ internal sealed record InstallScriptsManifest(
     string Version,
     string SourceCommit,
     string SourceRef,
+    bool Signed,
     string PublishedAt,
     IReadOnlyList<InstallScriptEntry> Scripts);
 

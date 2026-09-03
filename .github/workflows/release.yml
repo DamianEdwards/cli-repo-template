@@ -149,6 +149,8 @@ jobs:
             { echo "::error::Release metadata version mismatch."; exit 1; }
           test "$(jq -r '.sourceCommit' "$METADATA")" = "$(git rev-list -n 1 '${{ github.ref_name }}')" ||
             { echo "::error::Release metadata source commit mismatch."; exit 1; }
+          test "$(jq -r '.windowsSigned' "$METADATA")" = false ||
+            { echo "::error::Promotable release metadata must identify unsigned Windows assets."; exit 1; }
           test "$(jq '[.assets[].runtimeIdentifier] | length > 0 and length == (unique | length)' "$METADATA")" = true ||
             { echo "::error::Release metadata runtime inventory is empty or duplicated."; exit 1; }
           if command -v sha256sum >/dev/null 2>&1; then
@@ -174,6 +176,8 @@ jobs:
     needs: [prepare-release]
     if: needs.prepare-release.outputs.release_exists != 'true'
     environment: production
+    outputs:
+      windows_signed: ${{ steps.signing-config.outputs.enabled }}
     permissions:
       contents: read
       id-token: write
@@ -196,7 +200,8 @@ jobs:
         shell: pwsh
         run: dotnet ./scripts/expand-windows-release-assets.cs -- --bundle-directory './artifacts/bundle' --working-directory './artifacts/windows-assets'
 
-      - name: Require signing configuration
+      - name: Detect signing configuration
+        id: signing-config
         shell: pwsh
         env:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -207,10 +212,19 @@ jobs:
           AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
         run: |
           $required = 'AZURE_CLIENT_ID','AZURE_TENANT_ID','AZURE_SUBSCRIPTION_ID','AZURE_SIGNING_ENDPOINT','AZURE_SIGNING_ACCOUNT','AZURE_CERT_PROFILE'
-          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
-          if ($missing.Count) { throw "Windows signing is mandatory. Missing secret(s): $($missing -join ', ')." }
+          $configured = @($required | Where-Object { -not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($configured.Count -eq 0) {
+            "enabled=false" >> $env:GITHUB_OUTPUT
+            Write-Warning 'Azure signing is not configured; publishing unsigned Windows payloads with portable attestations.'
+          } elseif ($configured.Count -ne $required.Count) {
+            $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+            throw "Azure signing is partially configured. Missing secret(s): $($missing -join ', ')."
+          } else {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          }
 
       - name: Azure login
+        if: steps.signing-config.outputs.enabled == 'true'
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -218,6 +232,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Sign all Windows executable payloads
+        if: steps.signing-config.outputs.enabled == 'true'
         uses: azure/artifact-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -241,6 +256,7 @@ jobs:
           exclude-interactive-browser-credential: true
 
       - name: Verify all signed Windows payloads
+        if: steps.signing-config.outputs.enabled == 'true'
         shell: pwsh
         run: |
           $payloadRoots = @(Get-ChildItem './artifacts/windows-assets' -Directory)
@@ -256,11 +272,11 @@ jobs:
             }
           }
 
-      - name: Repack signed Windows assets
+      - name: Repack Windows assets
         shell: pwsh
         run: dotnet ./scripts/compress-windows-release-assets.cs -- --working-directory './artifacts/windows-assets' --output-directory './artifacts/signed-windows-assets'
 
-      - name: Upload signed Windows assets
+      - name: Upload Windows assets
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: release-signed-windows-assets
@@ -293,19 +309,19 @@ jobs:
           name: release-unsigned-bundle
           path: ./artifacts/release
 
-      - name: Download signed Windows assets
+      - name: Download Windows assets
         if: needs.prepare-release.outputs.release_exists != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: release-signed-windows-assets
           path: ./artifacts/signed-windows-assets
 
-      - name: Overlay signed assets and regenerate metadata
+      - name: Overlay Windows assets and regenerate metadata
         if: needs.prepare-release.outputs.release_exists != 'true'
         shell: pwsh
         run: |
           Copy-Item './artifacts/signed-windows-assets/*' './artifacts/release' -Force
-          dotnet ./scripts/update-release-bundle-metadata.cs -- --bundle-directory './artifacts/release'
+          dotnet ./scripts/update-release-bundle-metadata.cs -- --bundle-directory './artifacts/release' --windows-signed '${{ needs.sign-windows.outputs.windows_signed }}'
 
       - name: Verify final bundle
         if: needs.prepare-release.outputs.release_exists != 'true'
@@ -314,6 +330,7 @@ jobs:
           set -euo pipefail
           test "$(jq -r '.version' ./artifacts/release/release-metadata.json)" = '${{ needs.prepare-release.outputs.version }}'
           test "$(jq -r '.sourceCommit' ./artifacts/release/release-metadata.json)" = "$(git rev-list -n 1 '${{ github.ref_name }}')"
+          test "$(jq -r '.windowsSigned' ./artifacts/release/release-metadata.json)" = '${{ needs.sign-windows.outputs.windows_signed }}'
           if command -v sha256sum >/dev/null 2>&1; then
             (cd ./artifacts/release && sha256sum --check checksums.txt)
           else
@@ -373,6 +390,7 @@ jobs:
           METADATA=./artifacts/existing-release/release-metadata.json
           test "$(jq -r '.version' "$METADATA")" = '${{ needs.prepare-release.outputs.version }}'
           test "$(jq -r '.sourceCommit' "$METADATA")" = "$(git rev-list -n 1 "$TAG")"
+          test "$(jq -r '.windowsSigned | type' "$METADATA")" = boolean
           test -s ./artifacts/existing-release/attestations.jsonl
           if command -v sha256sum >/dev/null 2>&1; then
             (cd ./artifacts/existing-release && sha256sum --check checksums.txt)

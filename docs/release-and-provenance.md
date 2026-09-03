@@ -1,6 +1,6 @@
 # Release, signing, and provenance
 
-This template includes workflows for GitHub Releases-based distribution, required production signing for Windows assets, and portable provenance verification.
+This template includes workflows for GitHub Releases-based distribution, optional Azure signing that lights up when fully configured, and portable provenance verification.
 
 ## Release channels
 
@@ -14,7 +14,7 @@ The template uses three release channels:
 
 - `ci.yml` builds and tests assets, publishes a public immutable Dev release, uploads a promotable bundle, and advances the mutable `release-state` branch
 - `publish-release.yml` is **Start App Release**, the normal manual entry point. It binds promotion to the exact successful CI run, repository, `main` commit, version, checksums, inventory, and source commit before dispatching the finalizer.
-- `release.yml` is **Finalize App Release**. It runs on the immutable release tag, requires production signing, publishes release-local `attestations.jsonl`, preserves an existing immutable release on rerun, and resumes only unfinished release-state advancement. Do not run it manually during normal operation.
+- `release.yml` is **Finalize App Release**. It runs on the immutable release tag, signs Windows payloads when Azure signing is configured, publishes release-local `attestations.jsonl`, preserves an existing immutable release on rerun, and resumes only unfinished release-state advancement. Do not run it manually during normal operation.
 - `bump-version.yml` updates the mutable `release-state` branch when you want to move between `pre`, `rc`, and `rtm` lines or bump the base version ahead of the next CI/dev cycle
 - `releases-cleanup.yml` runs on a schedule or manually to delete old Dev releases and old install-script snapshot releases while keeping the latest five of each by default
 
@@ -93,9 +93,9 @@ Recommended rules:
 
 `releases-cleanup.yml` deletes old install-script GitHub releases but intentionally leaves their protected snapshot tags in place. Dev cleanup deletes both the old Dev release and its tag because Dev tags are workflow-generated rolling build outputs.
 
-## Required signing configuration
+## Optional signing configuration
 
-Official application releases and install-script publication fail closed unless all production signing secrets are present:
+Official application releases and install-script publication use Azure signing when all of these production secrets are present:
 
 - `AZURE_CLIENT_ID`
 - `AZURE_TENANT_ID`
@@ -103,6 +103,8 @@ Official application releases and install-script publication fail closed unless 
 - `AZURE_SIGNING_ENDPOINT`
 - `AZURE_SIGNING_ACCOUNT`
 - `AZURE_CERT_PROFILE`
+
+If none are present, releases remain unsigned and rely on release metadata, checksums, and portable attestations. A partial configuration fails closed so a signing outage cannot silently produce unsigned artifacts.
 
 ### Optional repository variables
 
@@ -117,6 +119,7 @@ Official application releases and install-script publication fail closed unless 
 
 - The Windows installer script remains the single source of truth for Authenticode trust configuration. `Generate-VerifyProvenance.ps1` derives the embedded verifier from it during build.
 - Release assets carry a stable, sorted `payload-manifest.json` that defines the exact managed payload. Install and update replace only previously managed files and preserve unrelated files.
+- Release metadata records whether Windows payloads were signed. Signed Windows updates require Authenticode verification; unsigned Windows updates require the release-local portable archive attestation.
 - On Linux/macOS, the CLI self-update path verifies the release-local `attestations.jsonl` portable Sigstore bundles with the `Sigstore` NuGet package.
 - Official Pre-release and Stable assets are attested in `release.yml` on the exact release tag ref, and Unix verification pins to that workflow + tag combination.
 - On Linux/macOS, `install-templatecli.sh` verifies release-local portable bundles with `cosign`. `cosign` is therefore a prerequisite unless `--skip-provenance` is used or a Dev build is being installed.

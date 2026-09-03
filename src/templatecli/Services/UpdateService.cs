@@ -296,7 +296,7 @@ public sealed class UpdateService
 
             var metadataPath = Path.Combine(tempRoot, "release-metadata.json");
             var expectedHash = GetExpectedHash(checksumsPath, assetName);
-            var (metaOk, metaErr) = _provenanceVerifier.ValidateReleaseMetadata(
+            var (metaOk, windowsPayloadSigned, metaErr) = _provenanceVerifier.ValidateReleaseMetadata(
                 metadataPath,
                 assetName,
                 expectedHash,
@@ -309,7 +309,9 @@ public sealed class UpdateService
 
             // On Windows, Authenticode applies to the extracted executable rather than the ZIP container.
             // On Linux/macOS, official release archives are attested in the tag-bound release workflow.
-            if (!OperatingSystem.IsWindows() && !update.IsDevBuild && !skipProvenance)
+            if (!update.IsDevBuild
+                && !skipProvenance
+                && (!OperatingSystem.IsWindows() || !windowsPayloadSigned))
             {
                 if (!_releaseService.DownloadReleaseAsset(
                         update.ReleaseTag,
@@ -338,7 +340,10 @@ public sealed class UpdateService
             PayloadInstaller.ValidateManifest(extractPath);
 
             // Verify every executable payload file on Windows.
-            if (OperatingSystem.IsWindows() && !update.IsDevBuild && !skipProvenance)
+            if (OperatingSystem.IsWindows()
+                && windowsPayloadSigned
+                && !update.IsDevBuild
+                && !skipProvenance)
             {
                 var (trustOk, trustErr) =
                     await _provenanceVerifier.VerifyWindowsPayloadAsync(extractPath, ct);
@@ -378,6 +383,7 @@ public sealed class UpdateService
             state.BackupDirectory = Path.Combine(
                 parentDir,
                 $".{Path.GetFileName(installDir)}.old-{Guid.NewGuid():N}");
+            state.WindowsPayloadSigned = windowsPayloadSigned;
             ClearDeferredInstallMetadata(state);
             state.LastCheckTime = DateTimeOffset.UtcNow;
             state.ErrorMessage = null;
@@ -536,7 +542,10 @@ public sealed class UpdateService
         _stateStore.SaveUpdateState(state);
 
         // Re-verify every staged executable before install on Windows.
-        if (OperatingSystem.IsWindows() && !skipProvenance && state.StagedVersion is not null)
+        if (OperatingSystem.IsWindows()
+            && state.WindowsPayloadSigned
+            && !skipProvenance
+            && state.StagedVersion is not null)
         {
             if (VersionHelper.TryParse(state.StagedVersion, out var stagedVer) && !VersionHelper.IsDevBuild(stagedVer))
             {

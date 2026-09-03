@@ -13,12 +13,18 @@ var bundleDirectoryOption = new Option<string>("--bundle-directory")
     Description = "Release bundle directory containing release-metadata.json.",
     Required = true
 };
+var windowsSignedOption = new Option<bool>("--windows-signed")
+{
+    Description = "Whether the Windows payload was Authenticode signed."
+};
 
 var command = new RootCommand("Regenerate release bundle checksums and metadata.");
 command.Options.Add(bundleDirectoryOption);
+command.Options.Add(windowsSignedOption);
 command.SetAction(parseResult => ExecuteHandled(() =>
 {
     var bundleDirectory = Path.GetFullPath(parseResult.GetValue(bundleDirectoryOption)!);
+    var windowsSigned = parseResult.GetValue(windowsSignedOption);
     var metadataPath = Path.Combine(bundleDirectory, "release-metadata.json");
 
     EnsureDirectoryExists(bundleDirectory, "Bundle directory");
@@ -52,6 +58,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
     var updatedMetadata = new ReleaseMetadataDocument(
         metadata.Version,
         metadata.SourceCommit,
+        windowsSigned,
         updatedAssets,
         updatedAssets.Where(asset => string.Equals(asset.Platform, "win", StringComparison.Ordinal)).ToArray());
 
@@ -126,6 +133,7 @@ static void Fail(string message)
 internal sealed record ReleaseMetadataDocument(
     string Version,
     string? SourceCommit,
+    bool WindowsSigned,
     IReadOnlyList<ReleaseAsset> Assets,
     IReadOnlyList<ReleaseAsset> WindowsAssets);
 

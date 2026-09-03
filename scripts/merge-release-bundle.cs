@@ -119,6 +119,7 @@ command.SetAction(parseResult => ExecuteHandled(() =>
     var releaseMetadata = new ReleaseMetadata(
         releaseVersion,
         sourceCommit ?? throw new InvalidOperationException("Release bundle source commit is missing."),
+        false,
         sortedAssets,
         sortedAssets.Where(asset => string.Equals(asset.Platform, "win", StringComparison.Ordinal)).ToArray());
 
@@ -198,6 +199,7 @@ internal sealed record ReleaseAsset(
 internal sealed record ReleaseMetadata(
     string Version,
     string SourceCommit,
+    bool WindowsSigned,
     IReadOnlyList<ReleaseAsset> Assets,
     IReadOnlyList<ReleaseAsset> WindowsAssets);
 
